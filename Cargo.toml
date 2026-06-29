@@ -1,0 +1,67 @@
+[package]
+name = "zerodrive"
+version = "0.1.0"
+edition = "2021"
+description = "Decentralized, secure file drive over Nostr + Iroh"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Crypto
+bip39 = { version = "2", features = ["rand"] }
+bip32 = "0.5"
+secp256k1 = { version = "0.29", features = ["global-context"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+aead = { version = "0.5", features = ["stream"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+getrandom = "0.2"
+hex = "0.4"
+
+# Secure prompt
+rpassword = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Networking
+nostr-sdk = { version = "0.38", features = ["nip06"] }
+iroh = "0.28"
+iroh-blobs = "0.28"
+iroh-io = "0.6"
+
+# Error handling
+anyhow = "1"
+bytes = "1"
+futures-core = "0.3"
+thiserror = "2"
+
+# Logging / output
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+owo-colors = "4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Filesystem paths
+dirs = "6"
+
+# Progress bars
+indicatif = "0.17"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
