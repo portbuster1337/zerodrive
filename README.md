@@ -23,6 +23,20 @@ When you upload a file, it gets split into 1 MiB chunks, each encrypted with a u
 
 The daemon auto-spawns whenever you run a command and lives in its own process group (Ctrl+C won't kill it).
 
+### Size limits per mnemonic
+
+The manifest (file/drive metadata) is published as a Nostr kind-30078 event. Different relays have different message size limits:
+
+| Default relay | Message limit | Max files |
+|---|---|---|
+| relay.damus.io | 64 KB (strfry default) | ~70 |
+| nostr.wine | 512 KB | ~620 |
+| relay.nostr.band | unknown | varies |
+
+Each file entry in the manifest is ~460 bytes after encryption and base64 encoding. The manifest must fit within at least one relay's limit for publishing to work.
+
+Individual file size is not limited by the manifest. Iroh handles arbitrary blob sizes (terabytes). Web UI single uploads are capped at 4 GiB by the server. The CLI has no upload size limit.
+
 ## Container format
 
 Files are stored in a custom frame format:
@@ -43,7 +57,7 @@ Each chunk gets a unique nonce: `nonce_prefix || u32_be(chunk_index)`. The 4-byt
 |---|---|
 | `create-drive <name>` | New empty drive |
 | `upload <drive> <path...>` | Upload files; `*` uploads everything in CWD; `--as-name` to rename |
-| `download <drive> <name>` | Download a file; `-o` for output path |
+| `download <drive> <name>` | Download a file; `*` downloads all files; `-o` for output path |
 | `list [drive]` | List drives or files in a drive |
 | `delete <drive> [name]` | Delete a file or whole drive; `--purge` removes blobs from local store |
 | `status` | Check if the daemon is alive |

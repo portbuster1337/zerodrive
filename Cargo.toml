@@ -70,3 +70,5 @@ tower = "0.4"
 lto = true
 strip = true
 codegen-units = 1
+opt-level = "s"
+panic = "abort"
