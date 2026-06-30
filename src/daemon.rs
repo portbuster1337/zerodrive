@@ -120,7 +120,7 @@ async fn connect_ipc() -> Result<IpcStream> {
 }
 
 /// Sanitize a filename to prevent path traversal.
-fn sanitize_filename(name: &str) -> String {
+pub fn sanitize_filename(name: &str) -> String {
     name.rsplit('/')
         .next()
         .unwrap_or(name)
