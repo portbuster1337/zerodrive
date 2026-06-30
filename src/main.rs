@@ -37,10 +37,11 @@ enum Command {
     CreateDrive {
         name: String,
     },
-    /// Upload a file to a drive
+    /// Upload files to a drive (use * for all files in CWD)
     Upload {
         drive: String,
-        path: String,
+        #[arg(num_args = 1..)]
+        paths: Vec<String>,
         #[arg(long)]
         as_name: Option<String>,
     },
@@ -143,8 +144,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
             output::success(format!("Drive '{name}' created (manifest updated on Nostr)"));
         }
 
-        Command::Upload { drive, path, as_name } => {
-            if path == "*" {
+        Command::Upload { drive, paths, as_name } => {
+            let want_all = paths.iter().any(|p| p == "*");
+            if want_all {
                 let cwd = std::env::current_dir()?;
                 let mut entries = Vec::new();
                 let mut dir = tokio::fs::read_dir(&cwd).await?;
@@ -179,35 +181,40 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 output::success(format!("Uploaded {count} file(s) to '{drive}'"));
             } else {
                 let cwd = std::env::current_dir()?;
-                let abs_path = std::path::Path::new(path);
-                let abs_path = if abs_path.is_absolute() {
-                    abs_path.to_path_buf()
-                } else {
-                    cwd.join(abs_path)
-                };
-                let file_name = as_name.clone().unwrap_or_else(|| {
-                    abs_path.file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.clone())
-                });
+                let count = paths.len();
+                for (i, p) in paths.iter().enumerate() {
+                    let abs_path = std::path::Path::new(p);
+                    let abs_path = if abs_path.is_absolute() {
+                        abs_path.to_path_buf()
+                    } else {
+                        cwd.join(abs_path)
+                    };
+                    let file_name = as_name.clone().unwrap_or_else(|| {
+                        abs_path.file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| p.clone())
+                    });
 
-                let pb = indicatif::ProgressBar::new(0);
-                pb.set_style(
-                    indicatif::ProgressStyle::default_bar()
-                        .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                        .unwrap()
-                        .progress_chars("=> "),
-                );
-                pb.set_message(format!("Uploading {file_name}"));
-                let resp = daemon::send_command("upload", serde_json::json!({
-                    "drive": drive, "path": abs_path.to_string_lossy(), "as": file_name,
-                }), Some(pb)).await?;
-                if let Some(err) = resp.error { anyhow::bail!("{err}"); }
-                if let Some(ref result) = resp.result {
-                    let hash = result["hash"].as_str().unwrap_or("?");
-                    let size = result["size"].as_u64().unwrap_or(0);
-                    output::success(format!("Uploaded {drive}/{file_name} → {hash} ({})", output::format_bytes(size)));
+                    output::info(format!("[{}/{}] Uploading {file_name}...", i + 1, count));
+                    let pb = indicatif::ProgressBar::new(0);
+                    pb.set_style(
+                        indicatif::ProgressStyle::default_bar()
+                            .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                            .unwrap()
+                            .progress_chars("=> "),
+                    );
+                    pb.set_message(format!("Uploading {file_name}"));
+                    let resp = daemon::send_command("upload", serde_json::json!({
+                        "drive": drive, "path": abs_path.to_string_lossy(), "as": file_name,
+                    }), Some(pb)).await?;
+                    if let Some(err) = resp.error { anyhow::bail!("{err}"); }
+                    if let Some(ref result) = resp.result {
+                        let hash = result["hash"].as_str().unwrap_or("?");
+                        let size = result["size"].as_u64().unwrap_or(0);
+                        output::success(format!("Uploaded {drive}/{file_name} → {hash} ({})", output::format_bytes(size)));
+                    }
                 }
+                output::success(format!("Uploaded {count} file(s) to '{drive}'"));
             }
         }
 
