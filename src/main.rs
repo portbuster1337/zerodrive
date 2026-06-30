@@ -6,6 +6,7 @@ mod manifest;
 mod output;
 mod pointer;
 mod prompt;
+mod web;
 
 use anyhow::{Context, Result};
 use crate::daemon::sanitize_filename;
@@ -22,12 +23,16 @@ struct Cli {
     #[arg(global = true, long)]
     verbose: bool,
 
+    /// Serve the web frontend on localhost
+    #[arg(global = true, long)]
+    web: bool,
+
     /// Nostr relay URLs (comma-separated)
     #[arg(global = true, long, value_delimiter = ',')]
     relays: Vec<String>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Parser)]
@@ -101,9 +106,25 @@ async fn main() {
             .init();
     }
 
-    let result = match &cli.command {
-        Command::DaemonInternal => run_daemon_internal(&cli).await,
-        _ => run_cli(cli).await,
+    if cli.command.is_none() && !cli.web {
+        use clap::CommandFactory;
+        let _ = Cli::command().print_help();
+        println!();
+        return;
+    }
+    let result = if cli.web {
+        let relays = if cli.relays.is_empty() {
+            default_relays()
+        } else {
+            cli.relays.clone()
+        };
+        web::run_web(relays).await.map(|_| ())
+    } else {
+        let cmd = cli.command.as_ref().unwrap();
+        match cmd {
+            Command::DaemonInternal => run_daemon_internal(&cli).await,
+            _ => run_cli(cli).await,
+        }
     };
 
     if let Err(e) = result {
@@ -119,9 +140,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
         cli.relays.clone()
     };
 
+    let cmd = cli.command.as_ref().unwrap();
+
     // Commands that need the daemon running.
     let needs_daemon = matches!(
-        &cli.command,
+        cmd,
         Command::CreateDrive { .. }
             | Command::Upload { .. }
             | Command::Download { .. }
@@ -137,7 +160,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         None
     };
 
-    match &cli.command {
+    match cmd {
         Command::CreateDrive { name } => {
             let resp = daemon::send_command("create_drive", serde_json::json!({ "name": name }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }

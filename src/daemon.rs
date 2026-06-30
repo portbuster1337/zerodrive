@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::io::Read;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use anyhow::{Context, Result};
+use serde_json::json;
 use iroh::node::Node;
 use iroh_blobs::store::mem::Store as MemStore;
 use tokio::sync::mpsc;
@@ -140,6 +141,7 @@ pub struct DaemonState {
     pub relays: Vec<String>,
     pub node_addr_str: String,
     pub shutdown: CancellationToken,
+    last_sync: Instant,
 }
 
 impl DaemonState {
@@ -161,18 +163,18 @@ impl DaemonState {
 
     /// Re-resolve the manifest from Nostr, replacing the in-memory copy if successful.
     /// Uses a short timeout so it degrades gracefully when offline.
+    /// Only actually syncs if at least 10s have passed since the last sync.
     pub async fn sync_manifest(&mut self) {
+        if self.last_sync.elapsed() < Duration::from_secs(10) { return; }
         let Some(ref pointer) = self.pointer else { return };
         let mk = self.keys.manifest_key;
-        // Short timeout so list/download don't hang
         match tokio::time::timeout(Duration::from_secs(3), pointer.resolve(&mk)).await {
             Ok(Ok(Some(manifest))) => {
                 self.manifest = manifest;
             }
-            _ => {
-                // keep current manifest
-            }
+            _ => {}
         }
+        self.last_sync = Instant::now();
     }
 }
 
@@ -245,6 +247,7 @@ pub async fn run_daemon(
         relays,
         node_addr_str,
         shutdown: shutdown.clone(),
+        last_sync: Instant::now(),
     }));
 
     // Listen on IPC socket / TCP port
@@ -529,7 +532,11 @@ async fn process_command(
             match drive_name {
                 Some("") | None => {
                     let drives = s.manifest.list_drives();
-                    IpcResponse { id, result: Some(serde_json::json!({ "drives": drives })), error: None, progress: None }
+                    let drive_details: Vec<serde_json::Value> = drives.iter().map(|name| {
+                        let file_count = s.manifest.list_files(name).map(|f| f.len()).unwrap_or(0);
+                        json!({ "name": name, "file_count": file_count })
+                    }).collect();
+                    IpcResponse { id, result: Some(serde_json::json!({ "drives": drives, "drive_details": drive_details })), error: None, progress: None }
                 }
                 Some(name) => match s.manifest.list_files(name) {
                     Ok(files) => IpcResponse {
