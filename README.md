@@ -6,6 +6,15 @@ It works like a minimal cloud drive: create drives, upload files, download them 
 
 There's also a `--web` flag that serves a local browser UI so you don't have to use the terminal if you'd rather click things.
 
+## What? Where? Who?
+
+| What | Where | Who can read it? |
+| :--- | :--- | :--- |
+| **Your Mnemonic** | In your head (or password manager) | Only you. |
+| **Encrypted File Chunks** | P2P Network (Iroh nodes) | No one (without your File Key). |
+| **Encrypted File Map** | Nostr Relays (Public bulletin boards) | No one (without your Manifest Key). |
+| **Decrypted Files** | Your local disk (when you download) | Only you. |
+
 ## How it works
 
 One mnemonic phrase derives everything: your Nostr identity (for the manifest pointer), your Iroh P2P key (for blob transfer), and two AES-256-GCM keys (one for the manifest, one for the files). Nothing leaves your machine without being encrypted first.
