@@ -7,13 +7,15 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use anyhow::{Context, Result};
-use iroh::node::FsNode;
+use iroh::node::Node;
+use iroh_blobs::store::mem::Store as MemStore;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::blob_store::BlobStore;
+use crate::blob_store::{BlobStore, ProgressTx};
 use crate::derive::DerivedKeys;
 use crate::manifest::Manifest;
 use crate::pointer::ManifestPointer;
@@ -132,10 +134,9 @@ fn sanitize_filename(name: &str) -> String {
 /// State held by the running daemon process.
 pub struct DaemonState {
     pub keys: DerivedKeys,
-    pub node: FsNode,
-    pub pointer: ManifestPointer,
+    pub node: Node<MemStore>,
+    pub pointer: Option<ManifestPointer>,
     pub manifest: Manifest,
-    pub blob_dir: PathBuf,
     pub relays: Vec<String>,
     pub node_addr_str: String,
     pub shutdown: CancellationToken,
@@ -149,24 +150,40 @@ impl DaemonState {
     /// Publish manifest and return event ID (avoids borrow conflicts).
     pub async fn publish_manifest(&mut self) -> Result<String> {
         let mk = self.keys.manifest_key;
-        self.pointer
-            .publish_and_update(&mut self.manifest, &mk)
-            .await
+        if let Some(ref pointer) = self.pointer {
+            pointer
+                .publish_and_update(&mut self.manifest, &mk)
+                .await
+        } else {
+            Ok("offline".into())
+        }
+    }
+
+    /// Re-resolve the manifest from Nostr, replacing the in-memory copy if successful.
+    /// Uses a short timeout so it degrades gracefully when offline.
+    pub async fn sync_manifest(&mut self) {
+        let Some(ref pointer) = self.pointer else { return };
+        let mk = self.keys.manifest_key;
+        // Short timeout so list/download don't hang
+        match tokio::time::timeout(Duration::from_secs(3), pointer.resolve(&mk)).await {
+            Ok(Ok(Some(manifest))) => {
+                self.manifest = manifest;
+            }
+            _ => {
+                // keep current manifest
+            }
+        }
     }
 }
 
 /// Main daemon entry point.
 pub async fn run_daemon(
     keys: DerivedKeys,
-    blob_dir: PathBuf,
     relays: Vec<String>,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(&blob_dir).await?;
-
-    // Create iroh node
+    // Create ephemeral iroh node (no disk writes)
     let iroh_secret = iroh::base::key::SecretKey::from_bytes(&keys.iroh_secret_key_bytes);
-    let node = FsNode::persistent(&blob_dir)
-        .await?
+    let node = Node::memory()
         .secret_key(iroh_secret)
         .spawn()
         .await?;
@@ -177,11 +194,31 @@ pub async fn run_daemon(
     info!("Daemon NodeID: {node_id}");
 
     // Connect Nostr, resolve or create manifest
-    let pointer = ManifestPointer::new(&keys.nostr_secret_key, &relays).await?;
-    let mut manifest = pointer
-        .resolve(&keys.manifest_key)
-        .await?
-        .unwrap_or_else(Manifest::new);
+    let pointer = ManifestPointer::new(&keys.nostr_secret_key, &relays).await
+        .map_err(|e| { warn!("Nostr init failed (will retry): {e}"); e })
+        .ok();
+    let mut manifest = if let Some(ref p) = pointer {
+        // Retry resolve a few times in case relays are slow or not yet connected
+        let mut result = None;
+        for attempt in 0..5 {
+            match p.resolve(&keys.manifest_key).await {
+                Ok(Some(m)) => { result = Some(m); break; }
+                Ok(None) => {
+                    warn!("Manifest resolve attempt {}/5: no manifest returned (relays may not be ready yet)", attempt + 1);
+                    if attempt < 4 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Manifest resolve attempt {}/5 failed: {e}", attempt + 1);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        result.unwrap_or_else(Manifest::new)
+    } else {
+        Manifest::new()
+    };
 
     // Register as provider for any blobs we hold
     for drive in manifest.drives.values_mut() {
@@ -193,9 +230,11 @@ pub async fn run_daemon(
             }
         }
     }
-    pointer
-        .publish_and_update(&mut manifest, &keys.manifest_key)
-        .await?;
+    if let Some(ref p) = pointer {
+        if let Err(e) = p.publish_and_update(&mut manifest, &keys.manifest_key).await {
+            warn!("Initial manifest publish failed: {e}");
+        }
+    }
 
     let shutdown = CancellationToken::new();
     let state = Arc::new(Mutex::new(DaemonState {
@@ -203,7 +242,6 @@ pub async fn run_daemon(
         node,
         pointer,
         manifest,
-        blob_dir,
         relays,
         node_addr_str,
         shutdown: shutdown.clone(),
@@ -261,6 +299,8 @@ pub struct IpcResponse {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<serde_json::Value>,
 }
 
 async fn handle_ipc(
@@ -269,7 +309,8 @@ async fn handle_ipc(
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut reader = BufReader::new(reader);
     const MAX_LINE: usize = 64 * 1024;
     let mut line = String::new();
@@ -284,11 +325,12 @@ async fn handle_ipc(
             let resp = IpcResponse {
                 id: 0,
                 result: None,
-                error: Some("line too long".into()),
+                error: Some("line too long".into()), progress: None,
             };
             let mut json = serde_json::to_vec(&resp)?;
             json.push(b'\n');
-            let _ = writer.write_all(&json).await;
+            let mut w = writer.lock().await;
+            let _ = w.write_all(&json).await;
             break;
         }
 
@@ -298,21 +340,45 @@ async fn handle_ipc(
                 let resp = IpcResponse {
                     id: 0,
                     result: None,
-                    error: Some(format!("parse error: {e}")),
+                    error: Some(format!("parse error: {e}")), progress: None,
                 };
                 let mut json = serde_json::to_vec(&resp)?;
                 json.push(b'\n');
-                writer.write_all(&json).await?;
-                writer.flush().await?;
+                let mut w = writer.lock().await;
+                w.write_all(&json).await?;
+                w.flush().await?;
                 continue;
             }
         };
 
-        let response = process_command(cmd, &state).await;
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+
+        // Spawn a task to forward progress messages to the client concurrently
+        let progress_writer = writer.clone();
+        let progress_handle = tokio::spawn(async move {
+            let mut rx = progress_rx;
+            while let Some((current, total)) = rx.recv().await {
+                let msg = serde_json::json!({"id": 0, "progress": {"current": current, "total": total}});
+                if let Ok(json) = serde_json::to_vec(&msg) {
+                    let mut bytes = json;
+                    bytes.push(b'\n');
+                    let mut w = progress_writer.lock().await;
+                    let _ = w.write_all(&bytes).await;
+                    let _ = w.flush().await;
+                }
+            }
+        });
+
+        let response = process_command(cmd, &state, progress_tx).await;
+
+        // Wait for the progress task to finish draining (channel closes when all senders drop)
+        let _ = progress_handle.await;
+
         let mut json = serde_json::to_vec(&response)?;
         json.push(b'\n');
-        writer.write_all(&json).await?;
-        writer.flush().await?;
+        let mut w = writer.lock().await;
+        w.write_all(&json).await?;
+        w.flush().await?;
     }
     Ok(())
 }
@@ -320,6 +386,7 @@ async fn handle_ipc(
 async fn process_command(
     cmd: IpcCommand,
     state: &Arc<Mutex<DaemonState>>,
+    progress_tx: ProgressTx,
 ) -> IpcResponse {
     let id = cmd.id;
 
@@ -331,10 +398,10 @@ async fn process_command(
                 id,
                 result: Some(serde_json::json!({
                     "node_id": s.node_id(),
-                    "blob_dir": s.blob_dir.to_string_lossy(),
                     "num_relays": s.relays.len(),
                 })),
                 error: None,
+                progress: None,
             }
         }
 
@@ -345,16 +412,19 @@ async fn process_command(
                 id,
                 result: Some(serde_json::json!("stopping")),
                 error: None,
+                progress: None,
             }
         }
 
         "create_drive" => {
             let name = cmd.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let mut s = state.lock().await;
-            s.manifest.create_drive(name);
+            if let Err(e) = s.manifest.create_drive(name) {
+                return IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None };
+            }
             match s.publish_manifest().await {
-                Ok(_) => IpcResponse { id, result: Some(serde_json::json!({ "ok": true })), error: None },
-                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                Ok(_) => IpcResponse { id, result: Some(serde_json::json!({ "ok": true })), error: None, progress: None },
+                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
             }
         }
 
@@ -363,9 +433,16 @@ async fn process_command(
             let path = cmd.params.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let fname = cmd.params.get("as").and_then(|v| v.as_str()).unwrap_or(&path).to_string();
 
+            // Validate inputs before doing work
             let local_path = PathBuf::from(&path);
             if !local_path.exists() {
-                return IpcResponse { id, result: None, error: Some("file not found".into()) };
+                return IpcResponse { id, result: None, error: Some("file not found".into()), progress: None };
+            }
+            {
+                let s = state.lock().await;
+                if s.manifest.get_drive(&drive).is_err() {
+                    return IpcResponse { id, result: None, error: Some(format!("drive '{drive}' not found")), progress: None };
+                }
             }
 
             // Clone what we need and release the lock before the long-running upload
@@ -373,23 +450,24 @@ async fn process_command(
                 let s = state.lock().await;
                 (s.node.clone(), s.keys.file_key, s.node_addr_str.clone())
             };
-            match BlobStore::upload(&node, &local_path, &file_key, false).await {
+            match BlobStore::upload(&node, &local_path, &file_key, Some(progress_tx.clone())).await {
                 Ok((hash, size)) => {
                     let mut s = state.lock().await;
 
                     if let Err(e) = s.manifest.add_file(&drive, &fname, &hash, size, &node_addr_str) {
-                        return IpcResponse { id, result: None, error: Some(format!("{e}")) };
+                        return IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None };
                     }
                     match s.publish_manifest().await {
                         Ok(_) => IpcResponse {
                             id,
                             result: Some(serde_json::json!({ "hash": hash, "size": size })),
                             error: None,
+                            progress: None,
                         },
-                        Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                        Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
                     }
                 }
-                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
             }
         }
 
@@ -399,16 +477,18 @@ async fn process_command(
             let out = cmd.params.get("out").and_then(|v| v.as_str()).map(|s| PathBuf::from(s.to_string()));
             let out_path = out.unwrap_or_else(|| PathBuf::from(sanitize_filename(&fname)));
 
-            let s = state.lock().await;
+            let mut s = state.lock().await;
+            s.sync_manifest().await;
             let drive_obj = match s.manifest.get_drive(&drive) {
                 Ok(d) => d,
-                Err(e) => return IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                Err(e) => return IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
             };
             let entry = match drive_obj.files.iter().find(|f| f.name == fname) {
                 Some(f) => f.clone(),
                 None => return IpcResponse {
                     id, result: None,
                     error: Some(format!("file '{fname}' not found in drive '{drive}'")),
+                    progress: None,
                 },
             };
             drop(s);
@@ -423,39 +503,42 @@ async fn process_command(
 
             if !has_local {
                 if let Err(e) = fetch_from_providers(state, &hash_str, &providers).await {
-                    return IpcResponse { id, result: None, error: Some(format!("fetch failed: {e}")) };
+                    return IpcResponse { id, result: None, error: Some(format!("fetch failed: {e}")), progress: None };
                 }
             }
 
             let s = state.lock().await;
-            match BlobStore::download(&s.node, &hash_str, &out_path, &s.keys.file_key, file_size, false).await {
+            match BlobStore::download(&s.node, &hash_str, &out_path, &s.keys.file_key, file_size, Some(progress_tx.clone())).await {
                 Ok(size) => IpcResponse {
                     id,
                     result: Some(serde_json::json!({ "path": out_path.to_string_lossy(), "size": size })),
                     error: None,
+                    progress: None,
                 },
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&out_path).await;
-                    IpcResponse { id, result: None, error: Some(format!("{e}")) }
+                    IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None }
                 }
             }
         }
 
         "list" => {
             let drive_name = cmd.params.get("drive").and_then(|v| v.as_str());
-            let s = state.lock().await;
+            let mut s = state.lock().await;
+            s.sync_manifest().await;
             match drive_name {
                 Some("") | None => {
                     let drives = s.manifest.list_drives();
-                    IpcResponse { id, result: Some(serde_json::json!({ "drives": drives })), error: None }
+                    IpcResponse { id, result: Some(serde_json::json!({ "drives": drives })), error: None, progress: None }
                 }
                 Some(name) => match s.manifest.list_files(name) {
                     Ok(files) => IpcResponse {
                         id,
                         result: Some(serde_json::json!({ "drive": name, "files": files })),
                         error: None,
+                        progress: None,
                     },
-                    Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                    Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
                 },
             }
         }
@@ -476,7 +559,7 @@ async fn process_command(
                     None
                 };
                 if let Err(e) = s.manifest.remove_file(&drive, name) {
-                    return IpcResponse { id, result: None, error: Some(format!("{e}")) };
+                    return IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None };
                 }
                 if let Some(hash) = hash_to_delete {
                     // Delete from local blob store (best-effort)
@@ -488,7 +571,7 @@ async fn process_command(
             } else {
                 let removed_drive = s.manifest.drives.remove(&drive);
                 if removed_drive.is_none() {
-                    return IpcResponse { id, result: None, error: Some(format!("drive '{drive}' not found")) };
+                    return IpcResponse { id, result: None, error: Some(format!("drive '{drive}' not found")), progress: None };
                 }
                 if purge {
                     for file in removed_drive.unwrap().files {
@@ -501,8 +584,8 @@ async fn process_command(
                 s.manifest.updated_at = chrono::Utc::now().timestamp();
             }
             match s.publish_manifest().await {
-                Ok(_) => IpcResponse { id, result: Some(serde_json::json!({ "ok": true })), error: None },
-                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")) },
+                Ok(_) => IpcResponse { id, result: Some(serde_json::json!({ "ok": true })), error: None, progress: None },
+                Err(e) => IpcResponse { id, result: None, error: Some(format!("{e}")), progress: None },
             }
         }
 
@@ -510,6 +593,7 @@ async fn process_command(
             id,
             result: None,
             error: Some(format!("unknown method: {method}")),
+            progress: None,
         },
     }
 }
@@ -574,14 +658,13 @@ impl Drop for DaemonLock {
 }
 
 /// Spawn a detached daemon process, passing keys via piped stdin.
-pub fn spawn_daemon(keys: DerivedKeys, blob_dir: PathBuf, relays: Vec<String>) -> Result<()> {
+pub fn spawn_daemon(keys: DerivedKeys, relays: Vec<String>) -> Result<()> {
     let _lock = DaemonLock::acquire()?;
     let args = DaemonArgs {
         nostr_secret_key: keys.nostr_secret_key,
         iroh_secret_key_bytes: keys.iroh_secret_key_bytes,
         manifest_key: keys.manifest_key,
         file_key: keys.file_key,
-        blob_dir: blob_dir.to_string_lossy().to_string(),
         relays,
     };
 
@@ -593,6 +676,13 @@ pub fn spawn_daemon(keys: DerivedKeys, blob_dir: PathBuf, relays: Vec<String>) -
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put daemon in its own process group so SIGINT (Ctrl+C) doesn't kill it
+        cmd.process_group(0);
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -608,6 +698,8 @@ pub fn spawn_daemon(keys: DerivedKeys, blob_dir: PathBuf, relays: Vec<String>) -
         stdin.write_all(&keys_json)?;
         stdin.flush()?;
     }
+
+
 
     keys_json.zeroize();
     info!("Daemon spawned (PID: {})", child.id());
@@ -634,7 +726,11 @@ pub async fn is_daemon_running() -> bool {
 }
 
 /// Send a JSON command to the daemon, return the response.
-pub async fn send_command(method: &str, params: serde_json::Value) -> Result<IpcResponse> {
+pub async fn send_command(
+    method: &str,
+    params: serde_json::Value,
+    progress_bar: Option<indicatif::ProgressBar>,
+) -> Result<IpcResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let stream = connect_ipc().await?;
@@ -653,10 +749,29 @@ pub async fn send_command(method: &str, params: serde_json::Value) -> Result<Ipc
     writer.write_all(&json).await?;
     writer.flush().await?;
 
+    // Read response lines, updating progress bar or skipping progress messages
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    let resp: IpcResponse = serde_json::from_str(&line)?;
-    Ok(resp)
+    loop {
+        line.clear();
+        reader.read_line(&mut line).await?;
+        let resp: IpcResponse = serde_json::from_str(&line)?;
+        if let Some(ref p) = resp.progress {
+            if let (Some(current), Some(total)) = (
+                p.get("current").and_then(|v| v.as_u64()),
+                p.get("total").and_then(|v| v.as_u64()),
+            ) {
+                if let Some(ref pb) = progress_bar {
+                    pb.set_length(total);
+                    pb.set_position(current);
+                }
+            }
+            continue;
+        }
+        if let Some(ref pb) = progress_bar {
+            pb.finish_and_clear();
+        }
+        return Ok(resp);
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -665,6 +780,5 @@ pub struct DaemonArgs {
     pub iroh_secret_key_bytes: [u8; 32],
     pub manifest_key: [u8; 32],
     pub file_key: [u8; 32],
-    pub blob_dir: String,
     pub relays: Vec<String>,
 }

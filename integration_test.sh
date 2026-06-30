@@ -6,7 +6,6 @@ ZERODRIVE_BIN="./target/debug/zerodrive"
 MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 TEST_DIR=$(mktemp -d -t zerodrive-test-XXXXXX)
 FAKE_HOME="$TEST_DIR/home"
-BLOB_DIR="$TEST_DIR/blobs"
 
 mkdir -p "$FAKE_HOME"
 export HOME="$FAKE_HOME"
@@ -26,12 +25,12 @@ info() {
 }
 
 run_zd() {
-    echo "$MNEMONIC" | "$ZERODRIVE_BIN" --blob-dir "$BLOB_DIR" "$@"
+    echo "$MNEMONIC" | "$ZERODRIVE_BIN" "$@"
 }
 
 cleanup() {
     info "Cleaning up test environment..."
-    echo "$MNEMONIC" | "$ZERODRIVE_BIN" --blob-dir "$BLOB_DIR" stop >/dev/null 2>&1 || true
+    echo "$MNEMONIC" | "$ZERODRIVE_BIN" stop >/dev/null 2>&1 || true
     sleep 1
     rm -rf "$TEST_DIR"
 }

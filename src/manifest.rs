@@ -95,14 +95,17 @@ impl Manifest {
     }
 
     /// Create a new drive.
-    pub fn create_drive(&mut self, name: &str) -> &mut Drive {
+    pub fn create_drive(&mut self, name: &str) -> Result<&mut Drive> {
+        if self.drives.contains_key(name) {
+            anyhow::bail!("drive '{name}' already exists");
+        }
         let now = Utc::now().timestamp();
-        self.drives.entry(name.to_string()).or_insert(Drive {
+        self.drives.insert(name.to_string(), Drive {
             created_at: now,
             files: Vec::new(),
         });
         self.updated_at = now;
-        self.drives.get_mut(name).unwrap()
+        Ok(self.drives.get_mut(name).unwrap())
     }
 
     /// Add a file entry to a drive (node_addr is the full NodeAddr serialization).
@@ -115,7 +118,9 @@ impl Manifest {
         node_addr: &str,
     ) -> Result<()> {
         let drive = self.get_drive_mut(drive_name)?;
-        drive.files.retain(|f| f.name != name);
+        if drive.files.iter().any(|f| f.name == name) {
+            anyhow::bail!("file '{name}' already exists in drive '{drive_name}'");
+        }
         drive.files.push(FileEntry {
             name: name.to_string(),
             hash: hash.to_string(),

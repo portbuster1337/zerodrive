@@ -254,7 +254,7 @@ pub struct EncryptingReader {
 
 impl EncryptingReader {
     pub fn new<R: AsyncRead + Unpin + Send + 'static>(inner: R, key: &[u8; 32]) -> Self {
-        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(16);
         let key_arr = *key;
         tokio::spawn(async move {
             encrypt_to_channel(inner, tx, &key_arr).await;
@@ -293,7 +293,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
         let _ = send(Err(std::io::Error::other(e))).await;
         return;
     }
-    if &magic != MAGIC {
+    if magic != MAGIC {
         let _ = send(Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid magic",
@@ -369,7 +369,7 @@ pub struct DecryptingReader {
 impl DecryptingReader {
     #[allow(dead_code)]
     pub fn new<R: AsyncRead + Unpin + Send + 'static>(inner: R, key: &[u8; 32]) -> Self {
-        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(16);
         let key_arr = *key;
         tokio::spawn(async move {
             decrypt_to_channel(inner, tx, &key_arr).await;

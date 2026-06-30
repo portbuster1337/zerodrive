@@ -5,14 +5,20 @@ use std::task::{Context, Poll};
 use anyhow::{Context as _, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use iroh::net::NodeAddr;
-use iroh::node::FsNode;
-use iroh_blobs::store::fs::Store as FsStore;
+type IrohNode = iroh::node::Node<MemStore>;
+use iroh_blobs::store::mem::Store as MemStore;
 use iroh_blobs::store::{Map, Store};
-use iroh_blobs::BlobFormat;
-use iroh_blobs::Hash;
+#[cfg(test)]
+use iroh_blobs::store::MapEntry;
 #[cfg(test)]
 use iroh_io::AsyncSliceReaderExt;
+use iroh_blobs::BlobFormat;
+use iroh_blobs::Hash;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::mpsc;
+
+/// Channel for reporting progress (current_bytes, total_bytes).
+pub type ProgressTx = mpsc::UnboundedSender<(u64, u64)>;
 
 fn progress_style() -> ProgressStyle {
     ProgressStyle::default_bar()
@@ -24,6 +30,9 @@ fn progress_style() -> ProgressStyle {
 struct ProgressRead<R> {
     inner: R,
     pb: ProgressBar,
+    tx: Option<ProgressTx>,
+    total: u64,
+    last_reported: u64,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
@@ -38,6 +47,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
             let n = buf.filled().len() - before;
             if n > 0 {
                 self.pb.inc(n as u64);
+                let pos = self.pb.position();
+                if pos - self.last_reported >= 65536 {
+                    self.last_reported = pos;
+                    if let Some(tx) = &self.tx {
+                        let _ = tx.send((pos, self.total));
+                    }
+                }
             }
         }
         result
@@ -47,6 +63,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
 struct ProgressWrite<W> {
     inner: W,
     pb: ProgressBar,
+    tx: Option<ProgressTx>,
+    total: u64,
+    last_reported: u64,
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWrite<W> {
@@ -58,6 +77,13 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWrite<W> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
             self.pb.inc(*n as u64);
+            let pos = self.pb.position();
+            if pos - self.last_reported >= 65536 {
+                self.last_reported = pos;
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send((pos, self.total));
+                }
+            }
         }
         result
     }
@@ -76,10 +102,10 @@ impl BlobStore {
     /// Upload a file: encrypt via EncryptingReader, add encrypted blob.
     /// Returns (hash_string, original_file_size).
     pub async fn upload(
-        node: &FsNode,
+        node: &IrohNode,
         local_path: &Path,
         file_key: &[u8; 32],
-        show_progress: bool,
+        progress: Option<ProgressTx>,
     ) -> Result<(String, u64)> {
         let file = tokio::fs::File::open(local_path)
             .await
@@ -91,7 +117,7 @@ impl BlobStore {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let pb = if show_progress {
+        let pb = if progress.is_some() {
             let pb = ProgressBar::new(file_size);
             pb.set_style(progress_style());
             pb.set_message(format!("Uploading {fname}"));
@@ -100,25 +126,36 @@ impl BlobStore {
             ProgressBar::hidden()
         };
 
-        let progress_file = ProgressRead { inner: file, pb: pb.clone() };
+        if let Some(tx) = &progress {
+            let _ = tx.send((0, file_size));
+        }
+        let progress_file = ProgressRead {
+            inner: file,
+            pb: pb.clone(),
+            tx: progress.clone(),
+            total: file_size,
+            last_reported: 0,
+        };
         let encrypting_reader = crate::crypto_stream::EncryptingReader::new(progress_file, file_key);
 
         let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
+            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
                 iroh_blobs::protocol::ALPN,
             )
             .context("getting blobs protocol")?;
         let store = blobs_proto.store();
-        let reader = tokio::io::BufReader::new(encrypting_reader);
         let (temp_tag, _stored_size) = store
             .import_reader(
-                reader,
+                encrypting_reader,
                 BlobFormat::Raw,
                 iroh_blobs::util::progress::IgnoreProgressSender::default(),
             )
             .await
             .context("importing encrypted blob")?;
         pb.finish_and_clear();
+        if let Some(tx) = &progress {
+            let _ = tx.send((file_size, file_size));
+        }
         let hash = *temp_tag.hash();
         let hash_str = format!("blake3:{}", hash);
         Ok((hash_str, file_size))
@@ -128,12 +165,12 @@ impl BlobStore {
     /// Streams data chunk-by-chunk from the blob store through decryption to disk,
     /// never buffering the entire file in memory.
     pub async fn download(
-        node: &FsNode,
+        node: &IrohNode,
         blob_hash_str: &str,
         output_path: &Path,
         file_key: &[u8; 32],
         original_size: u64,
-        show_progress: bool,
+        progress: Option<ProgressTx>,
     ) -> Result<u64> {
         let hash = blob_hash_str
             .strip_prefix("blake3:")
@@ -142,24 +179,18 @@ impl BlobStore {
             .context("invalid blob hash")?;
 
         // Read blob data directly from the local store, bypassing quic-rpc
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .context("getting blobs protocol")?;
-        let store = blobs_proto.store();
-        let entry = store
-            .get(&hash)
-            .await
-            .context("looking up blob in store")?
-            .context("blob not found in local store")?;
-        let mut reader = entry.data_reader();
+        // Read blob into memory from the client API (Send-safe)
+        use tokio::io::AsyncReadExt;
+        let mut blob_buf = Vec::new();
+        let mut blob_reader = node.client().blobs().read(hash).await?;
+        blob_reader.read_to_end(&mut blob_buf).await?;
+        let mut slice: &[u8] = &blob_buf;
 
         let fname = output_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let pb = if show_progress {
+        let pb = if progress.is_some() {
             let pb = ProgressBar::new(original_size);
             pb.set_style(progress_style());
             pb.set_message(format!("Downloading {fname}"));
@@ -168,30 +199,39 @@ impl BlobStore {
             ProgressBar::hidden()
         };
 
+        if let Some(tx) = &progress {
+            let _ = tx.send((0, original_size));
+        }
         let output_file = tokio::fs::File::create(output_path).await?;
         let mut writer = ProgressWrite {
             inner: tokio::io::BufWriter::new(output_file),
             pb: pb.clone(),
+            tx: progress.clone(),
+            total: original_size,
+            last_reported: 0,
         };
-        crate::crypto_stream::decrypt_slice_to_writer(&mut reader, &mut writer, file_key)
+        crate::crypto_stream::decrypt_slice_to_writer(&mut slice, &mut writer, file_key)
             .await
             .context("decrypting blob")?;
         writer.flush().await?;
         pb.finish_and_clear();
+        if let Some(tx) = &progress {
+            let _ = tx.send((original_size, original_size));
+        }
 
         let meta = tokio::fs::metadata(output_path).await?;
         Ok(meta.len())
     }
 
     /// Check if a blob exists in the local store.
-    pub async fn has_blob(node: &FsNode, blob_hash_str: &str) -> Result<bool> {
+    pub async fn has_blob(node: &IrohNode, blob_hash_str: &str) -> Result<bool> {
         let hash = blob_hash_str
             .strip_prefix("blake3:")
             .unwrap_or(blob_hash_str)
             .parse::<Hash>()?;
 
         let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
+            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
                 iroh_blobs::protocol::ALPN,
             )
             .context("getting blobs protocol")?;
@@ -205,7 +245,7 @@ impl BlobStore {
     /// Download a blob from a remote peer and store it locally.
     /// `node_addr_str` is the serialized `NodeAddr` (Display format).
     pub async fn fetch_from_peer(
-        node: &FsNode,
+        node: &IrohNode,
         hash: &iroh_blobs::Hash,
         node_addr_str: &str,
     ) -> Result<()> {
@@ -236,9 +276,9 @@ mod tests {
     use super::*;
 
     /// Read blob data directly from the local store, bypassing quic-rpc.
-    async fn read_blob_local(node: &FsNode, hash: Hash) -> Result<Vec<u8>> {
+    async fn read_blob_local(node: &IrohNode, hash: Hash) -> Result<Vec<u8>> {
         let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
+            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
                 iroh_blobs::protocol::ALPN,
             )
             .context("getting blobs protocol")?;
@@ -248,28 +288,24 @@ mod tests {
             .await
             .context("looking up blob in store")?
             .context("blob not found in local store")?;
-        let mut reader = entry.data_reader();
+        let mut reader = entry.data_reader().await?;
         let bytes = reader.read_to_end().await?;
         Ok(bytes.to_vec())
     }
 
-    async fn make_node(blob_dir: &std::path::Path) -> FsNode {
-        let _ = std::fs::remove_dir_all(blob_dir);
-        std::fs::create_dir_all(blob_dir).unwrap();
+    async fn make_node() -> IrohNode {
         let secret = iroh::base::key::SecretKey::generate();
-        FsNode::persistent(blob_dir)
-            .await
-            .unwrap()
+        iroh::node::Node::memory()
             .secret_key(secret)
             .spawn()
             .await
             .unwrap()
     }
 
-    async fn upload_bytes(node: &FsNode, data: &[u8]) -> Hash {
+    async fn upload_bytes(node: &IrohNode, data: &[u8]) -> Hash {
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(data.to_vec()));
         let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
+            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
                 iroh_blobs::protocol::ALPN,
             )
             .unwrap();
@@ -287,9 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iroh_small_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("zd-test-{}", std::process::id()));
-        let blob_dir = dir.join("blobs");
-        let node = make_node(&blob_dir).await;
+        let node = make_node().await;
 
         let plaintext = b"ZD1\n\xab\x00\x00\x00\x05hello";
         let hash = upload_bytes(&node, plaintext).await;
@@ -297,14 +331,11 @@ mod tests {
         assert_eq!(bytes.len(), plaintext.len());
         assert_eq!(&bytes[..], plaintext);
         node.shutdown().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_iroh_large_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("zd-test-large-{}", std::process::id()));
-        let blob_dir = dir.join("blobs");
-        let node = make_node(&blob_dir).await;
+        let node = make_node().await;
 
         let data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
         let hash = upload_bytes(&node, &data).await;
@@ -312,14 +343,11 @@ mod tests {
         assert_eq!(bytes.len(), data.len());
         assert_eq!(&bytes[..], &data);
         node.shutdown().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_encrypt_store_decrypt() {
-        let dir = std::env::temp_dir().join(format!("zd-test-enc-{}", std::process::id()));
-        let blob_dir = dir.join("blobs");
-        let node = make_node(&blob_dir).await;
+        let node = make_node().await;
 
         let plaintext: Vec<u8> = (0..100).map(|i| i as u8).collect();
         let key = [0xab; 32];
@@ -335,7 +363,7 @@ mod tests {
         // Store the encrypted data
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(ct.clone()));
         let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<FsStore>>(
+            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
                 iroh_blobs::protocol::ALPN,
             )
             .unwrap();
@@ -352,7 +380,7 @@ mod tests {
 
         // Read back via data_reader
         let entry = store.get(&hash).await.unwrap().unwrap();
-        let mut reader = entry.data_reader();
+        let mut reader = entry.data_reader().await.unwrap();
         let stored = reader.read_to_end().await.unwrap().to_vec();
         eprintln!("stored {} bytes (same as input: {})", stored.len(), stored.len() == ct.len());
         assert_eq!(stored.len(), ct.len(), "size changed through store");
@@ -388,11 +416,10 @@ mod tests {
         eprintln!("DecryptingReader works directly (no iroh)");
 
         node.shutdown().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn upload_download_roundtrip(
-        node: &FsNode,
+        node: &IrohNode,
         data: &[u8],
         key: &[u8; 32],
     ) {
@@ -401,11 +428,11 @@ mod tests {
         let src = dir.join("src.bin");
         std::fs::write(&src, data).unwrap();
 
-        let (hash, _size) = BlobStore::upload(node, &src, key, false).await.unwrap();
+        let (hash, _size) = BlobStore::upload(node, &src, key, None).await.unwrap();
 
 
         let out = dir.join("out.bin");
-        let _size = BlobStore::download(node, &hash, &out, key, data.len() as u64, false).await.unwrap();
+        let _size = BlobStore::download(node, &hash, &out, key, data.len() as u64, None).await.unwrap();
 
         let downloaded = std::fs::read(&out).unwrap();
         assert_eq!(downloaded.len(), data.len());
@@ -416,9 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_file_then_download() {
-        let dir = std::env::temp_dir().join(format!("zd-test-file-{}", std::process::id()));
-        let blob_dir = dir.join("blobs");
-        let node = make_node(&blob_dir).await;
+        let node = make_node().await;
 
         let key = [0xcd; 32];
 
@@ -431,6 +456,5 @@ mod tests {
         eprintln!("2MB roundtrip OK");
 
         node.shutdown().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

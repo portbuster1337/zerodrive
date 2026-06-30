@@ -7,8 +7,6 @@ mod output;
 mod pointer;
 mod prompt;
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
@@ -26,10 +24,6 @@ struct Cli {
     /// Nostr relay URLs (comma-separated)
     #[arg(global = true, long, value_delimiter = ',')]
     relays: Vec<String>,
-
-    /// Directory for blob storage
-    #[arg(global = true, long, default_value = "")]
-    blob_dir: String,
 
     #[command(subcommand)]
     command: Command,
@@ -81,13 +75,6 @@ enum Command {
     DaemonInternal,
 }
 
-fn default_blob_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("zerodrive")
-        .join("blobs")
-}
-
 fn default_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
@@ -124,18 +111,13 @@ async fn main() {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
-    let blob_dir = if cli.blob_dir.is_empty() {
-        default_blob_dir()
-    } else {
-        PathBuf::from(&cli.blob_dir)
-    };
     let relays = if cli.relays.is_empty() {
         default_relays()
     } else {
         cli.relays.clone()
     };
 
-    // Only 3 commands need the daemon running. Check once, prompt only if spawning needed.
+    // Commands that need the daemon running.
     let needs_daemon = matches!(
         &cli.command,
         Command::CreateDrive { .. }
@@ -147,7 +129,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     let _ensure = if needs_daemon && !daemon::is_daemon_running().await {
         let k = get_keys()?;
-        ensure_daemon_running(&k, &blob_dir, &relays).await?;
+        ensure_daemon_running(&k, &relays).await?;
         Some(k)
     } else {
         None
@@ -155,7 +137,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     match &cli.command {
         Command::CreateDrive { name } => {
-            let resp = daemon::send_command("create_drive", serde_json::json!({ "name": name })).await?;
+            let resp = daemon::send_command("create_drive", serde_json::json!({ "name": name }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             output::success(format!("Drive '{name}' created (manifest updated on Nostr)"));
         }
@@ -167,9 +149,18 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone())
             });
+
+            let pb = indicatif::ProgressBar::new(0);
+            pb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                    .unwrap()
+                    .progress_chars("=> "),
+            );
+            pb.set_message(format!("Uploading {file_name}"));
             let resp = daemon::send_command("upload", serde_json::json!({
                 "drive": drive, "path": path, "as": file_name,
-            })).await?;
+            }), Some(pb)).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
                 let hash = result["hash"].as_str().unwrap_or("?");
@@ -179,9 +170,17 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
 
         Command::Download { drive, name, out } => {
+            let pb = indicatif::ProgressBar::new(0);
+            pb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                    .unwrap()
+                    .progress_chars("=> "),
+            );
+            pb.set_message(format!("Downloading {name}"));
             let resp = daemon::send_command("download", serde_json::json!({
                 "drive": drive, "name": name, "out": out,
-            })).await?;
+            }), Some(pb)).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
                 let path = result["path"].as_str().unwrap_or(name);
@@ -191,7 +190,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
 
         Command::List { drive } => {
-            let resp = daemon::send_command("list", serde_json::json!({ "drive": drive })).await?;
+            let resp = daemon::send_command("list", serde_json::json!({ "drive": drive }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
                 if let Some(drives) = result.get("drives") {
@@ -220,7 +219,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Delete { drive, name, purge } => {
             let resp = daemon::send_command("delete", serde_json::json!({
                 "drive": drive, "name": name, "purge": purge,
-            })).await?;
+            }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if name.is_some() {
                 output::success(format!("Deleted {drive}/{}", name.as_deref().unwrap_or("?")));
@@ -230,7 +229,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
 
         Command::Status => {
-            let resp = daemon::send_command("status", serde_json::json!({})).await?;
+            let resp = daemon::send_command("status", serde_json::json!({}), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
                 let node_id = result["node_id"].as_str().unwrap_or("?");
@@ -239,7 +238,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
 
         Command::Stop => {
-            match daemon::send_command("stop", serde_json::json!({})).await {
+            match daemon::send_command("stop", serde_json::json!({}), None).await {
                 Ok(_) => output::success("Daemon stopping"),
                 Err(_) => output::info("Daemon does not appear to be running"),
             }
@@ -265,7 +264,6 @@ async fn run_cli(cli: Cli) -> Result<()> {
 /// Run as the daemon (spawned via __daemon_internal__).
 async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
     let args = daemon::read_daemon_args_from_stdin()?;
-    let blob_dir = PathBuf::from(&args.blob_dir);
     let relays = args.relays.clone();
 
     let keys = DerivedKeys {
@@ -278,7 +276,7 @@ async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
     // Keys have been moved out; zeroize the args
     drop(args);
 
-    daemon::run_daemon(keys, blob_dir, relays).await
+    daemon::run_daemon(keys, relays).await
 }
 
 /// Prompt for mnemonic once and derive keys.
@@ -292,7 +290,6 @@ fn get_keys() -> Result<DerivedKeys> {
 /// Ensure the daemon is running; if not, spawn it.
 async fn ensure_daemon_running(
     keys: &DerivedKeys,
-    blob_dir: &std::path::Path,
     relays: &[String],
 ) -> Result<()> {
     if daemon::is_daemon_running().await {
@@ -310,9 +307,12 @@ async fn ensure_daemon_running(
 
     let relays_vec = relays.to_vec();
 
-    daemon::spawn_daemon(daemon_keys, blob_dir.to_path_buf(), relays_vec)?;
+    daemon::spawn_daemon(daemon_keys, relays_vec)?;
 
     // Wait for daemon to start
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    for _ in 0..20 {
+        if daemon::is_daemon_running().await { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     Ok(())
 }
