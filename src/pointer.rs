@@ -7,15 +7,17 @@ use nostr_sdk::Client;
 
 use crate::manifest::Manifest;
 
-const DEFAULT_RELAYS: &[&str] = &[
+pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nostr.wine",
     "wss://relay.nostr.band",
 ];
+pub const MANIFEST_SIZE_LIMIT: usize = 48 * 1024; // 48 KiB — safe margin below most relay limits (64 KiB std)
 const D_TAG_VALUE: &str = "zerodrive/manifest";
 const KIND_30078: u16 = 30078;
 
 /// Wraps Nostr communication for reading/writing the manifest.
+#[derive(Clone)]
 pub struct ManifestPointer {
     keys: Keys,
     client: Client,
@@ -46,6 +48,12 @@ impl ManifestPointer {
     pub async fn publish(&self, manifest: &Manifest, enc_key: &[u8; 32]) -> Result<String> {
         let ciphertext = manifest.encrypt(enc_key).await?;
         let content = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+        if content.len() > MANIFEST_SIZE_LIMIT {
+            anyhow::bail!(
+                "manifest too large ({} bytes, limit ~{} KiB). Add relays with higher limits or remove files.",
+                content.len(), MANIFEST_SIZE_LIMIT / 1024,
+            );
+        }
 
         let builder = EventBuilder::new(Kind::Custom(KIND_30078), content)
             .tag(Tag::identifier(D_TAG_VALUE));

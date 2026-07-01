@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use axum::{
     extract::{Multipart, Path, State},
     http::{HeaderMap, StatusCode},
@@ -9,17 +12,21 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use bytes::Bytes;
+use futures_core::Stream;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use serde_json::json;
 use tokio::sync::Mutex;
-use tower_http::cors::CorsLayer;
-
+use tokio_util::sync::CancellationToken;
 use crate::daemon::{self, sanitize_filename};
 use crate::manifest::FileEntry;
 
 struct WebState {
     relays: Vec<String>,
     session_token: Option<String>,
+    shutdown_token: CancellationToken,
 }
 
 type SharedState = Arc<Mutex<WebState>>;
@@ -40,6 +47,7 @@ pub async fn run_web(relays: Vec<String>) -> Result<u16, anyhow::Error> {
     let state = Arc::new(Mutex::new(WebState {
         relays,
         session_token: None,
+        shutdown_token: CancellationToken::new(),
     }));
 
     let protected = Router::new()
@@ -56,7 +64,6 @@ pub async fn run_web(relays: Vec<String>) -> Result<u16, anyhow::Error> {
         .route("/", get(root_handler))
         .route("/api/setup", post(setup_handler))
         .merge(protected)
-        .layer(CorsLayer::permissive())
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024))
         .with_state(state);
 
@@ -79,11 +86,17 @@ async fn auth_middleware(
     let authorized = {
         let s = state.lock().await;
         s.session_token.as_ref().map_or(false, |token| {
-            headers
+            let provided = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v == format!("Bearer {token}"))
-                .unwrap_or(false)
+                .unwrap_or("");
+            let expected = format!("Bearer {token}");
+            let mut hasher = Sha256::new();
+            hasher.update(expected.as_bytes());
+            let expected_hash = hasher.finalize_reset();
+            hasher.update(provided.as_bytes());
+            let provided_hash = hasher.finalize();
+            bool::from(expected_hash.ct_eq(&provided_hash))
         })
     };
 
@@ -183,6 +196,7 @@ async fn setup_handler(
         Ok(k) => k,
         Err(e) => return api_error(format!("key derivation failed: {e}")),
     };
+    drop(mnemonic);
 
     if let Err(e) = daemon::spawn_daemon(keys, relays) {
         return server_error(format!("failed to start daemon: {e}"));
@@ -191,11 +205,18 @@ async fn setup_handler(
     // Store token immediately; daemon may take time to connect to Nostr relays
     state.lock().await.session_token = Some(token.clone());
 
-    // Spawn background task to wait for daemon readiness (no timeout — it will eventually connect)
+    // Spawn background task to wait for daemon readiness, tied to shutdown token
+    let cancel = {
+        let s = state.lock().await;
+        s.shutdown_token.clone()
+    };
     tokio::spawn(async move {
         for _ in 0..120 {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
             if daemon::is_daemon_running().await { return; }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
 
@@ -282,11 +303,7 @@ async fn upload_handler(
 ) -> impl IntoResponse {
     use tokio::io::AsyncWriteExt;
 
-    let mut temp_dir = std::env::temp_dir();
-    temp_dir.push("zerodrive-web-uploads");
-    let _ = tokio::fs::create_dir_all(&temp_dir).await;
-
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let file_name = field
             .file_name()
             .map(|s| sanitize_filename(s))
@@ -300,13 +317,38 @@ async fn upload_handler(
                 )
             });
 
+        // Use a UUID subdirectory to avoid temp file collisions
+        let upload_id = uuid::Uuid::new_v4();
+        let mut temp_dir = std::env::temp_dir();
+        temp_dir.push("zerodrive-web-uploads");
+        temp_dir.push(upload_id.to_string());
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
         let temp_path = temp_dir.join(&file_name);
-        let data = field.bytes().await.unwrap_or_default();
+
+        // Stream multipart body directly to temp file (no full buffering)
         let mut file = match tokio::fs::File::create(&temp_path).await {
             Ok(f) => f,
             Err(_) => return server_error("failed to create temp file for upload").into_response(),
         };
-        let _ = file.write_all(&data).await;
+        loop {
+            match field.chunk().await {
+                Ok(Some(bytes)) => {
+                    if let Err(e) = file.write_all(&bytes).await {
+                        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                        return server_error(format!("write error: {e}")).into_response();
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                    return server_error(format!("upload read error: {e}")).into_response();
+                }
+            }
+        }
+        if let Err(e) = file.flush().await {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return server_error(format!("flush error: {e}")).into_response();
+        }
         drop(file);
 
         let result = ipc(
@@ -318,7 +360,7 @@ async fn upload_handler(
             }),
         )
         .await;
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
         match result {
             Ok(r) => {
@@ -339,38 +381,72 @@ async fn upload_handler(
 
 // ── API: Download ──
 
+/// A stream wrapper that removes the temp directory when the stream is dropped
+/// (after all bytes have been sent to the HTTP client).
+struct CleanupStream {
+    inner: tokio_util::io::ReaderStream<tokio::fs::File>,
+    dir: std::path::PathBuf,
+}
+
+impl Stream for CleanupStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for CleanupStream {
+    fn drop(&mut self) {
+        let dir = self.dir.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        });
+    }
+}
+
 async fn download_handler(
-    Path((drive, file)): Path<(String, String)>,
+    Path((drive, fname)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let out_dir = std::env::temp_dir().join("zerodrive-web-dl");
+    let dl_id = uuid::Uuid::new_v4();
+    let out_dir = std::env::temp_dir().join("zerodrive-web-dl").join(dl_id.to_string());
     let _ = tokio::fs::create_dir_all(&out_dir).await;
-    let out_path = out_dir.join(sanitize_filename(&file));
+    let safe_name = sanitize_filename(&fname);
+    let out_path = out_dir.join(&safe_name);
 
     match ipc(
         "download",
         json!({
             "drive": drive,
-            "name": file,
+            "name": fname,
             "out": out_path.to_string_lossy(),
         }),
     )
     .await
     {
-        Ok(_) => match tokio::fs::read(&out_path).await {
-            Ok(data) => {
-                let _ = tokio::fs::remove_file(&out_path).await;
-                Response::builder()
+        Ok(_) => match tokio::fs::File::open(&out_path).await {
+            Ok(file) => {
+                let content_length = file.metadata().await.map(|m| m.len()).ok();
+                let stream = CleanupStream { inner: tokio_util::io::ReaderStream::new(file), dir: out_dir };
+                let mut builder = Response::builder()
                     .header("Content-Type", "application/octet-stream")
                     .header(
                         "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", sanitize_filename(&file)),
-                    )
-                    .body(axum::body::Body::from(data))
-                    .unwrap()
+                        format!("attachment; filename=\"{}\"", safe_name),
+                    );
+                if let Some(len) = content_length {
+                    builder = builder.header("Content-Length", len.to_string());
+                }
+                builder.body(axum::body::Body::from_stream(stream)).unwrap()
             }
-            Err(e) => server_error(format!("failed to read downloaded file: {e}")).into_response(),
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&out_dir).await;
+                server_error(format!("failed to read downloaded file: {e}")).into_response()
+            },
         },
-        Err(resp) => resp,
+        Err(resp) => {
+            let _ = tokio::fs::remove_dir_all(&out_dir).await;
+            resp
+        },
     }
 }
 
@@ -381,6 +457,7 @@ const FRONTEND_HTML: &str = r###"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
 <title>ZeroDrive</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -586,7 +663,8 @@ function toast(msg, type) {
 }
 
 function escHtml(s) {
-  const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+  const d = document.createElement('div'); d.textContent = s;
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ── Setup ──
@@ -615,6 +693,7 @@ async function doSetup() {
     }).then(r => r.json());
     if (data.ok && data.token) {
       localStorage.setItem('zd_session_token', data.token);
+      input.value = '';  // clear mnemonic from DOM
       isSetup = false;
       document.getElementById('setupScreen').style.display = 'none';
       document.getElementById('app').style.display = 'block';
@@ -656,7 +735,19 @@ async function loadDrives() {
         grid.innerHTML = '<div class="empty"><div class="icon">&#x1F4C2;</div><p>No drives yet. Create one to get started.</p></div>';
         return;
       }
-      grid.innerHTML = data.map(d => '<div class="drive-card" onclick="openDrive(\'' + escHtml(d.name).replace(/'/g, "\\'") + '\')"><div class="name">' + escHtml(d.name) + '</div><div class="meta">' + d.file_count + ' file' + (d.file_count !== 1 ? 's' : '') + '</div><div class="actions"><button onclick="event.stopPropagation();deleteDrive(\'' + escHtml(d.name).replace(/'/g, "\\'") + '\')" title="Delete drive">&times;</button></div></div>').join('');
+      grid.innerHTML = data.map(d => '<div class="drive-card" data-name="' + escHtml(d.name) + '"><div class="name">' + escHtml(d.name) + '</div><div class="meta">' + d.file_count + ' file' + (d.file_count !== 1 ? 's' : '') + '</div><div class="actions"><button class="del-drive-btn" data-name="' + escHtml(d.name) + '" title="Delete drive">&times;</button></div></div>').join('');
+      // Delegate event listeners
+      document.getElementById('drivesGrid').onclick = function(e) {
+        const card = e.target.closest('.drive-card');
+        if (card && !e.target.closest('.del-drive-btn')) {
+          openDrive(card.dataset.name);
+        }
+        const delBtn = e.target.closest('.del-drive-btn');
+        if (delBtn) {
+          e.stopPropagation();
+          deleteDrive(delBtn.dataset.name);
+        }
+      };
       return;
     } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 1000)); }
   }
@@ -772,9 +863,16 @@ async function loadFiles() {
     if (!data.length) {
       html += '<div class="empty" style="padding:32px;"><p>No files in this drive.</p></div>';
     } else {
-      html += data.map(f => '<div class="file-row"><span class="name">' + escHtml(f.name) + '</span><span class="size">' + formatBytes(f.size) + '</span><span class="actions"><button class="dl-link" onclick="downloadFile(\'' + escHtml(currentDrive).replace(/'/g, "\\'") + '\',\'' + escHtml(f.name).replace(/'/g, "\\'") + '\')">Download</button><button class="del-btn" onclick="deleteFile(\'' + escHtml(f.name).replace(/'/g, "\\'") + '\')">Delete</button></span></div>').join('');
+      html += data.map(f => '<div class="file-row"><span class="name">' + escHtml(f.name) + '</span><span class="size">' + formatBytes(f.size) + '</span><span class="actions"><button class="dl-link" data-file="' + escHtml(f.name) + '">Download</button><button class="del-btn" data-file="' + escHtml(f.name) + '">Delete</button></span></div>').join('');
     }
     list.innerHTML = html;
+    // Delegate event listeners for files
+    list.onclick = function(e) {
+      const dlBtn = e.target.closest('.dl-link');
+      if (dlBtn) { downloadFile(currentDrive, dlBtn.dataset.file); }
+      const delBtn = e.target.closest('.del-btn');
+      if (delBtn) { deleteFile(delBtn.dataset.file); }
+    };
   } catch (e) { toast('Failed to load files: ' + e.message, 'error'); }
 }
 async function downloadFile(drive, name) {
@@ -783,7 +881,10 @@ async function downloadFile(drive, name) {
     const res = await fetch('/api/drives/' + encodeURIComponent(drive) + '/download/' + encodeURIComponent(name), {
       headers: token ? { 'Authorization': 'Bearer ' + token } : {},
     });
-    if (!res.ok) throw new Error('Download failed');
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Download failed');
+    }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

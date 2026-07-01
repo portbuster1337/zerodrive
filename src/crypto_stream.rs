@@ -15,15 +15,16 @@ use iroh_io::AsyncSliceReader;
 use zeroize::Zeroize;
 
 /// Encrypted container format:
-///   magic "ZD2\n" (4 bytes)
+///   magic "ZD3\n" (4 bytes)
 ///   nonce_prefix (8 bytes)
 ///   For each chunk:
 ///     chunk_size: u32 big-endian (ciphertext + tag, max CHUNK_SIZE + 16)
 ///     ciphertext + gcm_tag
+///   final zero-length chunk terminator (u32 BE = 0) — enables truncation detection
 ///
 /// AES-256-GCM nonce for chunk i: nonce_prefix || u32_be(i)
 /// Supports up to ~4 billion chunks (~4 PiB) without nonce reuse.
-const MAGIC: &[u8] = b"ZD2\n";
+const MAGIC: &[u8] = b"ZD3\n";
 const CHUNK_SIZE: usize = 1_048_576; // 1 MiB
 const NONCE_PREFIX_LEN: usize = 8;
 const TAG_LEN: usize = 16;
@@ -56,17 +57,21 @@ where
         let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
 
         let ciphertext = cipher
-            .encrypt(nonce, Payload { msg: &buf[..n], aad: b"" })
+            .encrypt(nonce, Payload { msg: &buf[..n], aad: MAGIC })
             .map_err(|e| anyhow::anyhow!("encrypt error: {e}"))?;
 
         let chunk_len = ciphertext.len() as u32;
         writer.write_all(&chunk_len.to_be_bytes()).await?;
         writer.write_all(&ciphertext).await?;
 
-        chunk_idx += 1;
+        chunk_idx = chunk_idx.checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("chunk index overflow (>4 billion chunks)"))?;
     }
+    // Write zero-length terminator for truncation detection
+    writer.write_all(&0u32.to_be_bytes()).await?;
     writer.flush().await?;
     nonce_prefix.zeroize();
+    buf.zeroize();
     Ok(())
 }
 
@@ -90,12 +95,12 @@ where
     let mut chunk_idx: u32 = 0;
 
     loop {
-        match reader.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
+        reader.read_exact(&mut len_buf).await?;
         let chunk_len = u32::from_be_bytes(len_buf) as usize;
+        if chunk_len == 0 {
+            // Zero-length terminator confirms clean end of stream
+            break;
+        }
         if chunk_len > MAX_CHUNK_CIPHER {
             bail!("chunk too large: {chunk_len}");
         }
@@ -108,7 +113,7 @@ where
         let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
 
         let plaintext = cipher
-            .decrypt(nonce, Payload { msg: &ciphertext, aad: b"" })
+            .decrypt(nonce, Payload { msg: &ciphertext, aad: MAGIC })
             .map_err(|e| anyhow::anyhow!("decrypt error at chunk {chunk_idx}: {e}"))?;
 
         writer.write_all(&plaintext).await?;
@@ -119,6 +124,7 @@ where
 }
 
 /// Decrypt an AsyncSliceReader (offset-based) chunk-by-chunk to a writer.
+#[allow(dead_code)]
 pub async fn decrypt_slice_to_writer<R: AsyncSliceReader + Unpin>(
     reader: &mut R,
     writer: &mut (impl AsyncWrite + Unpin),
@@ -140,13 +146,13 @@ pub async fn decrypt_slice_to_writer<R: AsyncSliceReader + Unpin>(
     let mut idx: u32 = 0;
 
     loop {
-        let len_bytes = match reader.read_exact_at(offset, 4).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        };
+        let len_bytes = reader.read_exact_at(offset, 4).await?;
         offset += 4;
         let chunk_len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        if chunk_len == 0 {
+            // Zero-length terminator confirms clean end of stream
+            break;
+        }
         if chunk_len > MAX_CHUNK_CIPHER {
             bail!("chunk too large: {chunk_len}");
         }
@@ -159,7 +165,7 @@ pub async fn decrypt_slice_to_writer<R: AsyncSliceReader + Unpin>(
         let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
 
         let plaintext = cipher
-            .decrypt(nonce, Payload { msg: &ciphertext, aad: b"" })
+            .decrypt(nonce, Payload { msg: &ciphertext, aad: MAGIC })
             .map_err(|e| anyhow::anyhow!("decrypt error at chunk {idx}: {e}"))?;
 
         writer.write_all(&plaintext).await?;
@@ -206,7 +212,7 @@ async fn encrypt_to_channel<R: AsyncRead + Unpin>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                let _ = send(Err(std::io::Error::other(e))).await;
+                let _ = send(Err(e)).await;
                 return;
             }
         };
@@ -215,7 +221,7 @@ async fn encrypt_to_channel<R: AsyncRead + Unpin>(
         chunk_nonce[NONCE_PREFIX_LEN..].copy_from_slice(&idx.to_be_bytes());
         let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
 
-        let ciphertext = match cipher.encrypt(nonce, Payload { msg: &buf[..n], aad: b"" }) {
+        let ciphertext = match cipher.encrypt(nonce, Payload { msg: &buf[..n], aad: MAGIC }) {
             Ok(c) => c,
             Err(e) => {
                 let _ = send(Err(std::io::Error::other(format!("encrypt: {e}")))).await;
@@ -230,8 +236,19 @@ async fn encrypt_to_channel<R: AsyncRead + Unpin>(
         if !send(Ok(Bytes::from(chunk_out))).await {
             return;
         }
-        idx += 1;
+        idx = match idx.checked_add(1) {
+            Some(v) => v,
+            None => {
+                let _ = send(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk index overflow (>4 billion chunks)",
+                ))).await;
+                return;
+            }
+        };
     }
+    // Zero-length terminator
+    let _ = send(Ok(Bytes::from(0u32.to_be_bytes().to_vec()))).await;
 }
 
 // ── Channel-based AsyncRead wrapper for encryption ──
@@ -250,16 +267,23 @@ impl Stream for ChanStream {
 /// AsyncRead wrapper that encrypts data on-the-fly via a background task.
 pub struct EncryptingReader {
     inner: StreamReader<ChanStream, Bytes>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl EncryptingReader {
     pub fn new<R: AsyncRead + Unpin + Send + 'static>(inner: R, key: &[u8; 32]) -> Self {
         let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(16);
         let key_arr = *key;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             encrypt_to_channel(inner, tx, &key_arr).await;
         });
-        Self { inner: StreamReader::new(ChanStream { rx }) }
+        Self { inner: StreamReader::new(ChanStream { rx }), handle }
+    }
+}
+
+impl Drop for EncryptingReader {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -290,7 +314,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
 
     let mut magic = [0u8; MAGIC.len()];
     if let Err(e) = inner.read_exact(&mut magic).await {
-        let _ = send(Err(std::io::Error::other(e))).await;
+        let _ = send(Err(e)).await;
         return;
     }
     if magic != MAGIC {
@@ -304,7 +328,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
 
     let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
     if let Err(e) = inner.read_exact(&mut nonce_prefix).await {
-        let _ = send(Err(std::io::Error::other(e))).await;
+        let _ = send(Err(e)).await;
         return;
     }
 
@@ -315,13 +339,17 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
 
     loop {
         if let Err(e) = inner.read_exact(&mut len_buf).await {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
-            }
-            let _ = send(Err(std::io::Error::other(e))).await;
+            let _ = send(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("truncated stream (missing terminator): {e}"),
+            )))
+            .await;
             return;
         }
         let chunk_len = u32::from_be_bytes(len_buf) as usize;
+        if chunk_len == 0 {
+            break;
+        }
         if chunk_len > MAX_CHUNK_CIPHER {
             let _ = send(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -333,7 +361,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
 
         let mut ciphertext = vec![0u8; chunk_len];
         if let Err(e) = inner.read_exact(&mut ciphertext).await {
-            let _ = send(Err(std::io::Error::other(e))).await;
+            let _ = send(Err(e)).await;
             return;
         }
 
@@ -341,7 +369,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
         chunk_nonce[NONCE_PREFIX_LEN..].copy_from_slice(&idx.to_be_bytes());
         let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
 
-        match cipher.decrypt(nonce, Payload { msg: &ciphertext, aad: b"" }) {
+        match cipher.decrypt(nonce, Payload { msg: &ciphertext, aad: MAGIC }) {
             Ok(plaintext) => {
                 if !send(Ok(Bytes::from(plaintext))).await {
                     return;
@@ -364,6 +392,7 @@ async fn decrypt_to_channel<R: AsyncRead + Unpin>(
 #[allow(dead_code)]
 pub struct DecryptingReader {
     inner: StreamReader<ChanStream, Bytes>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl DecryptingReader {
@@ -371,10 +400,16 @@ impl DecryptingReader {
     pub fn new<R: AsyncRead + Unpin + Send + 'static>(inner: R, key: &[u8; 32]) -> Self {
         let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(16);
         let key_arr = *key;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             decrypt_to_channel(inner, tx, &key_arr).await;
         });
-        Self { inner: StreamReader::new(ChanStream { rx }) }
+        Self { inner: StreamReader::new(ChanStream { rx }), handle }
+    }
+}
+
+impl Drop for DecryptingReader {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -391,6 +426,87 @@ impl AsyncRead for DecryptingReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn test_decrypt_truncated_stream() {
+        let key = [0xABu8; 32];
+        let data = b"Streaming truncation test data";
+
+        let mut ct = Vec::new();
+        let r = std::io::Cursor::new(data.to_vec());
+        let mut w = tokio::io::BufWriter::new(&mut ct);
+        encrypt_stream(tokio::io::BufReader::new(r), &mut w, &key).await.unwrap();
+        drop(w);
+
+        // Remove the last 4 bytes (the zero-length terminator)
+        ct.truncate(ct.len() - 4);
+
+        let mut pt = Vec::new();
+        let r = tokio::io::BufReader::new(std::io::Cursor::new(ct));
+        let mut w = tokio::io::BufWriter::new(&mut pt);
+        let result = decrypt_stream(r, &mut w, &key).await;
+
+        assert!(result.is_err(), "Decryption of truncated stream should fail");
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_invalid_magic() {
+        let key = [0xABu8; 32];
+        let mut ct = b"WRONG_MAGIC".to_vec();
+        ct.extend_from_slice(&[0u8; 20]);
+
+        let mut pt = Vec::new();
+        let r = tokio::io::BufReader::new(std::io::Cursor::new(ct));
+        let mut w = tokio::io::BufWriter::new(&mut pt);
+        let result = decrypt_stream(r, &mut w, &key).await;
+
+        assert!(result.is_err(), "Decryption with invalid magic should fail");
+        assert!(result.unwrap_err().to_string().contains("invalid magic bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_wrong_key() {
+        let key1 = [0xABu8; 32];
+        let key2 = [0xCDu8; 32];
+        let data = b"Secret data";
+
+        let mut ct = Vec::new();
+        let r = std::io::Cursor::new(data.to_vec());
+        let mut w = tokio::io::BufWriter::new(&mut ct);
+        encrypt_stream(tokio::io::BufReader::new(r), &mut w, &key1).await.unwrap();
+        drop(w);
+
+        let mut pt = Vec::new();
+        let r = tokio::io::BufReader::new(std::io::Cursor::new(ct));
+        let mut w = tokio::io::BufWriter::new(&mut pt);
+        let result = decrypt_stream(r, &mut w, &key2).await;
+
+        assert!(result.is_err(), "Decryption with wrong key should fail");
+        assert!(result.unwrap_err().to_string().contains("decrypt error at chunk 0"));
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_corrupted_chunk() {
+        let key = [0xABu8; 32];
+        let data = b"Corruption test data";
+
+        let mut ct = Vec::new();
+        let r = std::io::Cursor::new(data.to_vec());
+        let mut w = tokio::io::BufWriter::new(&mut ct);
+        encrypt_stream(tokio::io::BufReader::new(r), &mut w, &key).await.unwrap();
+        drop(w);
+
+        // Corrupt a byte in the middle of the ciphertext (skip magic + nonce + length prefix)
+        let corrupt_idx = 4 + 8 + 4 + 2;
+        ct[corrupt_idx] ^= 0xFF;
+
+        let mut pt = Vec::new();
+        let r = tokio::io::BufReader::new(std::io::Cursor::new(ct));
+        let mut w = tokio::io::BufWriter::new(&mut pt);
+        let result = decrypt_stream(r, &mut w, &key).await;
+
+        assert!(result.is_err(), "Decryption of corrupted chunk should fail");
+    }
+
     #[tokio::test]
     async fn test_roundtrip() {
         let key = [0xABu8; 32];

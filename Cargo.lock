@@ -1381,6 +1381,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5742,6 +5752,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "uuid"
+version = "1.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6496,6 +6517,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fs2",
  "futures-core",
  "getrandom 0.2.17",
  "hex",
@@ -6512,6 +6534,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -6519,6 +6542,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 

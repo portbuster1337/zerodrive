@@ -178,13 +178,8 @@ impl BlobStore {
             .parse::<Hash>()
             .context("invalid blob hash")?;
 
-        // Read blob data directly from the local store, bypassing quic-rpc
-        // Read blob into memory from the client API (Send-safe)
-        use tokio::io::AsyncReadExt;
-        let mut blob_buf = Vec::new();
-        let mut blob_reader = node.client().blobs().read(hash).await?;
-        blob_reader.read_to_end(&mut blob_buf).await?;
-        let mut slice: &[u8] = &blob_buf;
+        // Stream blob directly from the iroh node, decrypting on the fly
+        let blob_reader = node.client().blobs().read(hash).await?;
 
         let fname = output_path
             .file_name()
@@ -210,7 +205,7 @@ impl BlobStore {
             total: original_size,
             last_reported: 0,
         };
-        crate::crypto_stream::decrypt_slice_to_writer(&mut slice, &mut writer, file_key)
+        crate::crypto_stream::decrypt_stream(blob_reader, &mut writer, file_key)
             .await
             .context("decrypting blob")?;
         writer.flush().await?;
@@ -220,7 +215,13 @@ impl BlobStore {
         }
 
         let meta = tokio::fs::metadata(output_path).await?;
-        Ok(meta.len())
+        let actual_size = meta.len();
+        if original_size > 0 && actual_size != original_size {
+            anyhow::bail!(
+                "downloaded file size mismatch: expected {original_size}, got {actual_size} — the file may be truncated"
+            );
+        }
+        Ok(actual_size)
     }
 
     /// Check if a blob exists in the local store.
@@ -238,7 +239,8 @@ impl BlobStore {
         let store = blobs_proto.store();
         match store.get(&hash).await {
             Ok(Some(_)) => Ok(true),
-            _ => Ok(false),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -263,8 +265,10 @@ impl BlobStore {
             .context("starting download from peer")?;
 
         let outcome = progress.await.context("waiting for download")?;
-        if outcome.downloaded_size > 0 || outcome.local_size > 0 {
+        if outcome.downloaded_size > 0 {
             Ok(())
+        } else if outcome.local_size > 0 {
+            Ok(()) // already had it locally
         } else {
             anyhow::bail!("peer returned no data")
         }
@@ -439,6 +443,30 @@ mod tests {
         assert_eq!(&downloaded[..], data);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_download_size_mismatch_detection() {
+        let node = make_node().await;
+        let key = [0xef; 32];
+
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+        let dir = std::env::temp_dir().join(format!("zd-mismatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, &data).unwrap();
+
+        let (hash, _size) = BlobStore::upload(&node, &src, &key, None).await.unwrap();
+
+        let out = dir.join("out.bin");
+        let wrong_size = (data.len() as u64) / 2;
+        let result = BlobStore::download(&node, &hash, &out, &key, wrong_size, None).await;
+
+        assert!(result.is_err(), "Download with wrong original_size should fail");
+        assert!(result.unwrap_err().to_string().contains("size mismatch"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

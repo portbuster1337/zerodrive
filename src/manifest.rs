@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use zeroize::Zeroize;
 use crate::crypto_stream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,11 +64,12 @@ impl Manifest {
     }
 
     pub async fn encrypt(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        let json = self.to_json()?;
+        let mut json = self.to_json()?;
         let mut ciphertext = Vec::with_capacity(json.len() + 64);
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(json));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(&json));
         let mut writer = tokio::io::BufWriter::new(&mut ciphertext);
         crypto_stream::encrypt_stream(reader, &mut writer, key).await?;
+        json.zeroize();
         Ok(ciphertext)
     }
 
@@ -77,7 +79,9 @@ impl Manifest {
         let mut writer = tokio::io::BufWriter::new(&mut plaintext);
         crypto_stream::decrypt_stream(reader, &mut writer, key).await?;
         drop(writer);
-        Self::from_json(&plaintext)
+        let result = Self::from_json(&plaintext);
+        plaintext.zeroize();
+        result
     }
 
     /// Get a drive by name, returns error if not found.
@@ -144,6 +148,15 @@ impl Manifest {
         Ok(())
     }
 
+    /// Count how many file entries across all drives reference a given hash.
+    pub fn hash_refcount(&self, hash: &str) -> usize {
+        self.drives
+            .values()
+            .flat_map(|d| &d.files)
+            .filter(|f| f.hash == hash)
+            .count()
+    }
+
     /// List drives or files in a drive.
     pub fn list_drives(&self) -> Vec<&str> {
         self.drives.keys().map(|s| s.as_str()).collect()
@@ -157,5 +170,58 @@ impl Manifest {
 impl Default for Manifest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_crud_and_duplicates() {
+        let mut m = Manifest::new();
+        m.create_drive("docs").unwrap();
+
+        m.add_file("docs", "resume.pdf", "blake3:hash1", 1024, "nodeaddr1").unwrap();
+
+        // Duplicate file name should fail
+        assert!(m.add_file("docs", "resume.pdf", "blake3:hash2", 2048, "nodeaddr1").is_err());
+
+        // Duplicate drive name should fail
+        assert!(m.create_drive("docs").is_err());
+
+        // Verify hash refcount (hash1 is referenced once)
+        assert_eq!(m.hash_refcount("blake3:hash1"), 1);
+
+        // Add same hash to another drive
+        m.create_drive("backup").unwrap();
+        m.add_file("backup", "resume_backup.pdf", "blake3:hash1", 1024, "nodeaddr2").unwrap();
+        assert_eq!(m.hash_refcount("blake3:hash1"), 2);
+
+        // Remove from one drive, refcount should drop
+        m.remove_file("docs", "resume.pdf").unwrap();
+        assert_eq!(m.hash_refcount("blake3:hash1"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_encryption_wrong_key_fails() {
+        let m = Manifest::new();
+        let key1 = [0xAB; 32];
+        let key2 = [0xCD; 32];
+
+        let ct = m.encrypt(&key1).await.unwrap();
+
+        // Decrypting with the wrong key should fail
+        let result = Manifest::decrypt(&ct, &key2).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_manifest_schema_validation() {
+        let bad_json = r#"{"version": 99, "schema": "wrong-schema", "created_at": 0, "updated_at": 0}"#;
+        let result = Manifest::from_json(bad_json.as_bytes());
+        assert!(result.is_err(), "wrong schema should fail validation");
+        assert!(result.unwrap_err().to_string().contains("unknown manifest schema"),
+            "error should mention unknown schema");
     }
 }

@@ -21,6 +21,7 @@ bip32 = "0.5"
 secp256k1 = { version = "0.29", features = ["global-context"] }
 hkdf = "0.12"
 sha2 = "0.10"
+subtle = "2"
 aes-gcm = "0.10"
 aead = { version = "0.5", features = ["stream"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
@@ -61,14 +62,17 @@ dirs = "6"
 # Progress bars
 indicatif = "0.17"
 
+# File locking
+fs2 = "0.4"
+
 # Web server
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tower = "0.4"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = true
 strip = true
 codegen-units = 1
 opt-level = "s"
-panic = "abort"

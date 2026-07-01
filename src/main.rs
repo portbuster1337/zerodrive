@@ -9,10 +9,10 @@ mod prompt;
 mod web;
 
 use anyhow::{Context, Result};
-use crate::daemon::sanitize_filename;
 use clap::Parser;
 use nostr_sdk::prelude::*;
 use tracing_subscriber::EnvFilter;
+use crate::daemon::sanitize_filename;
 
 use crate::derive::DerivedKeys;
 
@@ -83,11 +83,7 @@ enum Command {
 }
 
 fn default_relays() -> Vec<String> {
-    vec![
-        "wss://relay.damus.io".to_string(),
-        "wss://nostr.wine".to_string(),
-        "wss://relay.nostr.band".to_string(),
-    ]
+    crate::pointer::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
 }
 
 #[tokio::main]
@@ -150,6 +146,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             | Command::Download { .. }
             | Command::List { .. }
             | Command::Delete { .. }
+            | Command::Status
     );
 
     let _ensure = if needs_daemon && !daemon::is_daemon_running().await {
@@ -373,6 +370,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
     let args = daemon::read_daemon_args_from_stdin()?;
     let relays = args.relays.clone();
+    let lock_path = std::path::PathBuf::from(&args.lock_path);
 
     let keys = DerivedKeys {
         nostr_secret_key: args.nostr_secret_key,
@@ -384,6 +382,9 @@ async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
     // Keys have been moved out; zeroize the args
     drop(args);
 
+    // Adopt the daemon lock — holds it for our lifetime
+    let _daemon_lock = daemon::DaemonLock::adopt(lock_path);
+
     daemon::run_daemon(keys, relays).await
 }
 
@@ -391,7 +392,7 @@ async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
 fn get_keys() -> Result<DerivedKeys> {
     let mnemonic = prompt::secure_mnemonic_prompt("Enter mnemonic (24 words): ")?;
     let keys = derive::derive(&mnemonic)?;
-    let _ = mnemonic;
+    drop(mnemonic);
     Ok(keys)
 }
 

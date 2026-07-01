@@ -31,8 +31,8 @@ pub fn secure_mnemonic_prompt(prompt: &str) -> Result<Mnemonic> {
 
 /// Call once at startup to harden the process.
 pub fn forensic_harden() {
-    // Disable core dumps (Linux)
-    #[cfg(target_os = "linux")]
+    // Disable core dumps (Unix)
+    #[cfg(unix)]
     {
         let rlim = libc::rlimit {
             rlim_cur: 0,
