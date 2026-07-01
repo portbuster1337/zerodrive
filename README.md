@@ -6,6 +6,8 @@ It works like a minimal cloud drive: create drives, upload files, download them 
 
 There's also a `--web` flag that serves a local browser UI so you don't have to use the terminal if you'd rather click things.
 
+Generate a 24-word BIP-39 mnemonic at [iancoleman.io/bip39](https://iancoleman.io/bip39) to get started.
+
 ## What? Where? Who?
 
 | What | Where | Who can read it? |
