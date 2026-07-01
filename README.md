@@ -44,11 +44,12 @@ Individual file size is not limited by the manifest. Iroh handles arbitrary blob
 Files are stored in a custom frame format:
 
 ```
-magic  "ZD2\n"          4 bytes
+magic  "ZD3\n"          4 bytes
 nonce_prefix            8 bytes
   chunk_size: u32 BE    max 1,048,576 + 16
   ciphertext + GCM tag  variable
   ...repeated...
+  0x00000000            zero terminator (truncation detection)
 ```
 
 Each chunk gets a unique nonce: `nonce_prefix || u32_be(chunk_index)`. The 4-byte counter gives ~4 billion chunks, so ~4 PiB per file.
@@ -88,8 +89,13 @@ The upload progress bar uses `XMLHttpRequest` with `upload.onprogress` so it upd
 
 - Client-side encryption. The Nostr relay and P2P peers never see plaintext.
 - Streaming AES-256-GCM in 1 MiB chunks, never loading the whole file into memory.
+- Each chunk uses a unique nonce (random 8-byte prefix + 4-byte counter).
+- Container format bound as AAD (`ZD3\n` magic) to prevent chunk substitution.
 - `RLIMIT_CORE = 0` on Linux to prevent core dumps.
 - All key material zeroed on drop via `zeroize`.
+- Zero-length terminator detects truncated streams.
+- Constant-time session token comparison (SHA-256 + subtle).
+- OS-level advisory file locking (no stale lock files on crash).
 - One mnemonic controls everything. Lose it, lose your data.
 
 ## Key derivation
@@ -104,10 +110,14 @@ BIP‑39 mnemonic (24 words)
 
 The Iroh, manifest, and file keys use HKDF from the raw seed with domain-separated info strings.
 
-## Build
+## Pre-built binaries
+
+Pre-compiled binaries for Linux (x86_64) and Windows (x86_64, MinGW) are available on the [releases page](https://github.com/portbuster1337/zerodrive/releases). Just download the appropriate archive for your platform and extract it.
+
+## Build from source
 
 ```sh
-git clone <repo> && cd zerodrive
+git clone https://github.com/portbuster1337/zerodrive && cd zerodrive
 cargo build --release
 ./target/release/zerodrive --help
 ```
