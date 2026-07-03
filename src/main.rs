@@ -1,23 +1,12 @@
-mod blob_store;
-mod crypto_stream;
-mod daemon;
-mod derive;
-mod manifest;
-mod output;
-mod pointer;
-mod prompt;
-mod web;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
 use tracing_subscriber::EnvFilter;
-use crate::daemon::sanitize_filename;
-
-use crate::derive::DerivedKeys;
+use zerodrive::daemon::sanitize_filename;
+use zerodrive::derive::DerivedKeys;
 
 #[derive(Parser)]
-#[command(name = "zerodrive", about = "Decentralized, secure file drive over Nostr + Iroh")]
+#[command(name = "zerodrive", about = "Decentralized, secure file drive over Nostr")]
 struct Cli {
     /// Enable verbose debug output
     #[arg(global = true, long)]
@@ -65,8 +54,7 @@ enum Command {
     Delete {
         drive: String,
         name: Option<String>,
-        /// Also remove the blob from the local store
-        #[arg(long)]
+        #[arg(long, hide = true)]
         purge: bool,
     },
     /// Check daemon status
@@ -83,12 +71,12 @@ enum Command {
 }
 
 fn default_relays() -> Vec<String> {
-    crate::pointer::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+    zerodrive::pointer::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
 }
 
 #[tokio::main]
 async fn main() {
-    prompt::forensic_harden();
+    zerodrive::prompt::forensic_harden();
 
     let cli = Cli::parse();
 
@@ -108,25 +96,26 @@ async fn main() {
         println!();
         return;
     }
-    let result = if cli.web {
-        let relays = if cli.relays.is_empty() {
-            default_relays()
-        } else {
-            cli.relays.clone()
-        };
-        web::run_web(relays).await.map(|_| ())
-    } else {
-        let cmd = cli.command.as_ref().unwrap();
-        match cmd {
-            Command::DaemonInternal => run_daemon_internal(&cli).await,
-            _ => run_cli(cli).await,
-        }
-    };
-
+    let result: Result<(), anyhow::Error> = run_cli_or_web(cli).await;
+    
     if let Err(e) = result {
-        output::error(format!("{e:#}"));
+        zerodrive::output::error(format!("{e:#}"));
         std::process::exit(1);
     }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn run_cli_or_web(cli: Cli) -> Result<()> {
+    if cli.web {
+        let relays = if cli.relays.is_empty() { default_relays() } else { cli.relays.clone() };
+        return zerodrive::web::run_web(relays).await.map(|_| ());
+    }
+    run_cli(cli).await
+}
+
+#[cfg(target_os = "android")]
+async fn run_cli_or_web(_cli: Cli) -> Result<()> {
+    Ok(())
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
@@ -149,7 +138,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             | Command::Status
     );
 
-    let _ensure = if needs_daemon && !daemon::is_daemon_running().await {
+    let _ensure = if needs_daemon && !zerodrive::daemon::is_daemon_running().await {
         let k = get_keys()?;
         ensure_daemon_running(&k, &relays).await?;
         Some(k)
@@ -159,9 +148,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     match cmd {
         Command::CreateDrive { name } => {
-            let resp = daemon::send_command("create_drive", serde_json::json!({ "name": name }), None).await?;
+            let resp = zerodrive::daemon::send_command("create_drive", serde_json::json!({ "name": name }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
-            output::success(format!("Drive '{name}' created (manifest updated on Nostr)"));
+            zerodrive::output::success(format!("Drive '{name}' created (manifest updated on Nostr)"));
         }
 
         Command::Upload { drive, paths, as_name } => {
@@ -179,7 +168,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 entries.sort_by(|a, b| a.1.cmp(&b.1));
                 let count = entries.len();
                 for (i, (file_path, file_name)) in entries.iter().enumerate() {
-                    output::info(format!("[{}/{}] Uploading {file_name}...", i + 1, count));
+                    zerodrive::output::info(format!("[{}/{}] Uploading {file_name}...", i + 1, count));
                     let pb = indicatif::ProgressBar::new(0);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
@@ -188,17 +177,16 @@ async fn run_cli(cli: Cli) -> Result<()> {
                             .progress_chars("=> "),
                     );
                     pb.set_message(format!("Uploading {file_name}"));
-                    let resp = daemon::send_command("upload", serde_json::json!({
+                    let resp = zerodrive::daemon::send_command("upload", serde_json::json!({
                         "drive": drive, "path": file_path.to_string_lossy(), "as": file_name,
                     }), Some(pb)).await?;
                     if let Some(err) = resp.error { anyhow::bail!("{err}"); }
                     if let Some(ref result) = resp.result {
-                        let hash = result["hash"].as_str().unwrap_or("?");
                         let size = result["size"].as_u64().unwrap_or(0);
-                        output::success(format!("Uploaded {drive}/{file_name} → {hash} ({})", output::format_bytes(size)));
+                        zerodrive::output::success(format!("Uploaded {drive}/{file_name} ({})", zerodrive::output::format_bytes(size)));
                     }
                 }
-                output::success(format!("Uploaded {count} file(s) to '{drive}'"));
+                zerodrive::output::success(format!("Uploaded {count} file(s) to '{drive}'"));
             } else {
                 let cwd = std::env::current_dir()?;
                 let count = paths.len();
@@ -215,7 +203,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                             .unwrap_or_else(|| p.clone())
                     });
 
-                    output::info(format!("[{}/{}] Uploading {file_name}...", i + 1, count));
+                    zerodrive::output::info(format!("[{}/{}] Uploading {file_name}...", i + 1, count));
                     let pb = indicatif::ProgressBar::new(0);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
@@ -224,25 +212,24 @@ async fn run_cli(cli: Cli) -> Result<()> {
                             .progress_chars("=> "),
                     );
                     pb.set_message(format!("Uploading {file_name}"));
-                    let resp = daemon::send_command("upload", serde_json::json!({
+                    let resp = zerodrive::daemon::send_command("upload", serde_json::json!({
                         "drive": drive, "path": abs_path.to_string_lossy(), "as": file_name,
                     }), Some(pb)).await?;
                     if let Some(err) = resp.error { anyhow::bail!("{err}"); }
                     if let Some(ref result) = resp.result {
-                        let hash = result["hash"].as_str().unwrap_or("?");
                         let size = result["size"].as_u64().unwrap_or(0);
-                        output::success(format!("Uploaded {drive}/{file_name} → {hash} ({})", output::format_bytes(size)));
+                        zerodrive::output::success(format!("Uploaded {drive}/{file_name} ({})", zerodrive::output::format_bytes(size)));
                     }
                 }
-                output::success(format!("Uploaded {count} file(s) to '{drive}'"));
+                zerodrive::output::success(format!("Uploaded {count} file(s) to '{drive}'"));
             }
         }
 
         Command::Download { drive, name, out } => {
             if name == "*" {
-                let list_resp = daemon::send_command("list", serde_json::json!({ "drive": drive }), None).await?;
+                let list_resp = zerodrive::daemon::send_command("list", serde_json::json!({ "drive": drive }), None).await?;
                 if let Some(err) = list_resp.error { anyhow::bail!("{err}"); }
-                let files: Vec<manifest::FileEntry> = list_resp.result
+                let files: Vec<zerodrive::manifest::FileEntry> = list_resp.result
                     .and_then(|r| r.get("files").cloned())
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_default();
@@ -252,7 +239,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 let cwd = std::env::current_dir()?;
                 let count = files.len();
                 for (i, f) in files.iter().enumerate() {
-                    output::info(format!("[{}/{}] Downloading {}...", i + 1, count, f.name));
+                    zerodrive::output::info(format!("[{}/{}] Downloading {}...", i + 1, count, f.name));
                     let pb = indicatif::ProgressBar::new(0);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
@@ -262,17 +249,17 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     );
                     pb.set_message(format!("Downloading {}", f.name));
                     let out_path = cwd.join(sanitize_filename(&f.name));
-                    let resp = daemon::send_command("download", serde_json::json!({
+                    let resp = zerodrive::daemon::send_command("download", serde_json::json!({
                         "drive": drive, "name": f.name, "out": out_path.to_string_lossy(),
                     }), Some(pb)).await?;
                     if let Some(err) = resp.error { anyhow::bail!("{err}"); }
                     if let Some(ref result) = resp.result {
                         let path = result["path"].as_str().unwrap_or(&f.name);
                         let size = result["size"].as_u64().unwrap_or(0);
-                        output::success(format!("Downloaded {drive}/{} → {path} ({})", f.name, output::format_bytes(size)));
+                        zerodrive::output::success(format!("Downloaded {drive}/{} -> {path} ({})", f.name, zerodrive::output::format_bytes(size)));
                     }
                 }
-                output::success(format!("Downloaded {count} file(s) from '{drive}'"));
+                zerodrive::output::success(format!("Downloaded {count} file(s) from '{drive}'"));
             } else {
                 let pb = indicatif::ProgressBar::new(0);
                 pb.set_style(
@@ -282,39 +269,39 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         .progress_chars("=> "),
                 );
                 pb.set_message(format!("Downloading {name}"));
-                let resp = daemon::send_command("download", serde_json::json!({
+                let resp = zerodrive::daemon::send_command("download", serde_json::json!({
                     "drive": drive, "name": name, "out": out,
                 }), Some(pb)).await?;
                 if let Some(err) = resp.error { anyhow::bail!("{err}"); }
                 if let Some(ref result) = resp.result {
                     let path = result["path"].as_str().unwrap_or(name);
                     let size = result["size"].as_u64().unwrap_or(0);
-                    output::success(format!("Downloaded {drive}/{name} → {path} ({})", output::format_bytes(size)));
+                    zerodrive::output::success(format!("Downloaded {drive}/{name} -> {path} ({})", zerodrive::output::format_bytes(size)));
                 }
             }
         }
 
         Command::List { drive } => {
-            let resp = daemon::send_command("list", serde_json::json!({ "drive": drive }), None).await?;
+            let resp = zerodrive::daemon::send_command("list", serde_json::json!({ "drive": drive }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
                 if let Some(drives) = result.get("drives") {
                     let drives: Vec<String> = serde_json::from_value(drives.clone()).unwrap_or_default();
                     if drives.is_empty() {
-                        output::info("No drives found. Create one with 'zerodrive create-drive <name>'");
+                        zerodrive::output::info("No drives found. Create one with 'zerodrive create-drive <name>'");
                     } else {
                         println!("Drives:");
                         for d in &drives { println!("  {d}"); }
                     }
                 }
                 if let Some(files) = result.get("files") {
-                    let files: Vec<manifest::FileEntry> = serde_json::from_value(files.clone()).unwrap_or_default();
+                    let files: Vec<zerodrive::manifest::FileEntry> = serde_json::from_value(files.clone()).unwrap_or_default();
                     if files.is_empty() {
-                        output::info("No files in this drive.");
+                        zerodrive::output::info("No files in this drive.");
                     } else {
                         println!("Files in drive '{}':", drive.as_deref().unwrap_or("?"));
                         for f in &files {
-                            println!("  {}  {}  {}", output::format_bytes(f.size), &f.hash[..16.min(f.hash.len())], f.name);
+                            println!("  {}  {}", zerodrive::output::format_bytes(f.size), f.name);
                         }
                     }
                 }
@@ -322,30 +309,30 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
 
         Command::Delete { drive, name, purge } => {
-            let resp = daemon::send_command("delete", serde_json::json!({
+            let resp = zerodrive::daemon::send_command("delete", serde_json::json!({
                 "drive": drive, "name": name, "purge": purge,
             }), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if name.is_some() {
-                output::success(format!("Deleted {drive}/{}", name.as_deref().unwrap_or("?")));
+                zerodrive::output::success(format!("Deleted {drive}/{}", name.as_deref().unwrap_or("?")));
             } else {
-                output::success(format!("Deleted drive '{drive}'"));
+                zerodrive::output::success(format!("Deleted drive '{drive}'"));
             }
         }
 
         Command::Status => {
-            let resp = daemon::send_command("status", serde_json::json!({}), None).await?;
+            let resp = zerodrive::daemon::send_command("status", serde_json::json!({}), None).await?;
             if let Some(err) = resp.error { anyhow::bail!("{err}"); }
             if let Some(ref result) = resp.result {
-                let node_id = result["node_id"].as_str().unwrap_or("?");
-                output::success(format!("Daemon running (NodeID: {node_id})"));
+                let relays = result["relays"].as_u64().unwrap_or(0);
+                zerodrive::output::success(format!("Daemon running ({relays} relays)"));
             }
         }
 
         Command::Stop => {
-            match daemon::send_command("stop", serde_json::json!({}), None).await {
-                Ok(_) => output::success("Daemon stopping"),
-                Err(_) => output::info("Daemon does not appear to be running"),
+            match zerodrive::daemon::send_command("stop", serde_json::json!({}), None).await {
+                Ok(_) => zerodrive::output::success("Daemon stopping"),
+                Err(_) => zerodrive::output::info("Daemon does not appear to be running"),
             }
         }
 
@@ -360,7 +347,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             println!("Nostr public key (hex): {}", nostr_keys.public_key().to_hex());
         }
 
-        Command::DaemonInternal => unreachable!(),
+        Command::DaemonInternal => return run_daemon_internal(&cli).await,
     }
 
     Ok(())
@@ -368,13 +355,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
 /// Run as the daemon (spawned via __daemon_internal__).
 async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
-    let args = daemon::read_daemon_args_from_stdin()?;
+    let args = zerodrive::daemon::read_daemon_args_from_stdin()?;
     let relays = args.relays.clone();
     let lock_path = std::path::PathBuf::from(&args.lock_path);
 
     let keys = DerivedKeys {
         nostr_secret_key: args.nostr_secret_key,
-        iroh_secret_key_bytes: args.iroh_secret_key_bytes,
         manifest_key: args.manifest_key,
         file_key: args.file_key,
     };
@@ -383,15 +369,15 @@ async fn run_daemon_internal(_cli: &Cli) -> Result<()> {
     drop(args);
 
     // Adopt the daemon lock — holds it for our lifetime
-    let _daemon_lock = daemon::DaemonLock::adopt(lock_path);
+    let _daemon_lock = zerodrive::daemon::DaemonLock::adopt(lock_path);
 
-    daemon::run_daemon(keys, relays).await
+    zerodrive::daemon::run_daemon(keys, relays).await
 }
 
 /// Prompt for mnemonic once and derive keys.
 fn get_keys() -> Result<DerivedKeys> {
-    let mnemonic = prompt::secure_mnemonic_prompt("Enter mnemonic (24 words): ")?;
-    let keys = derive::derive(&mnemonic)?;
+    let mnemonic = zerodrive::prompt::secure_mnemonic_prompt("Enter mnemonic (24 words): ")?;
+    let keys = zerodrive::derive::derive(&mnemonic)?;
     drop(mnemonic);
     Ok(keys)
 }
@@ -401,26 +387,25 @@ async fn ensure_daemon_running(
     keys: &DerivedKeys,
     relays: &[String],
 ) -> Result<()> {
-    if daemon::is_daemon_running().await {
+    if zerodrive::daemon::is_daemon_running().await {
         return Ok(());
     }
 
-    output::info("Daemon not running, starting...");
+    zerodrive::output::info("Daemon not running, starting...");
 
     let daemon_keys = DerivedKeys {
         nostr_secret_key: keys.nostr_secret_key,
-        iroh_secret_key_bytes: keys.iroh_secret_key_bytes,
         manifest_key: keys.manifest_key,
         file_key: keys.file_key,
     };
 
     let relays_vec = relays.to_vec();
 
-    daemon::spawn_daemon(daemon_keys, relays_vec)?;
+    zerodrive::daemon::spawn_daemon(daemon_keys, relays_vec)?;
 
     // Wait for daemon to start
     for _ in 0..20 {
-        if daemon::is_daemon_running().await { break; }
+        if zerodrive::daemon::is_daemon_running().await { break; }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(())

@@ -3,28 +3,486 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
+use base64::Engine;
+use bytes::Bytes;
 use indicatif::{ProgressBar, ProgressStyle};
-use iroh::net::NodeAddr;
-type IrohNode = iroh::node::Node<MemStore>;
-use iroh_blobs::store::mem::Store as MemStore;
-use iroh_blobs::store::{Map, Store};
-#[cfg(test)]
-use iroh_blobs::store::MapEntry;
-#[cfg(test)]
-use iroh_io::AsyncSliceReaderExt;
-use iroh_blobs::BlobFormat;
-use iroh_blobs::Hash;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
+use nostr_sdk::prelude::*;
+use nostr_sdk::bitcoin::hashes::Hash as BitcoinHash;
 
-/// Channel for reporting progress (current_bytes, total_bytes).
+use crate::manifest::Shard;
+
 pub type ProgressTx = mpsc::UnboundedSender<(u64, u64)>;
+
+const SHARD_SIZE: usize = 40 * 1024 * 1024;
+
+const SERVERS: &[&str] = &[
+    "https://cdn.hzrd149.com/upload",
+    "https://blossom.primal.net/upload",
+    "https://nostr.download/upload",
+];
 
 fn progress_style() -> ProgressStyle {
     ProgressStyle::default_bar()
         .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
         .unwrap()
         .progress_chars("=> ")
+}
+
+pub struct BlobStore;
+
+impl BlobStore {
+    pub async fn upload(
+        local_path: &Path,
+        file_key: &[u8; 32],
+        progress: Option<ProgressTx>,
+    ) -> Result<(Vec<Shard>, u64)> {
+        let file = tokio::fs::File::open(local_path).await.context("opening file")?;
+        let metadata = file.metadata().await?;
+        let file_size = metadata.len();
+
+        let fname = local_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let pb = if progress.is_some() {
+            let pb = ProgressBar::new(file_size);
+            pb.set_style(progress_style());
+            pb.set_message(format!("Encrypting & Uploading {fname}"));
+            pb
+        } else { ProgressBar::hidden() };
+
+        if let Some(tx) = &progress { let _ = tx.send((0, file_size)); }
+
+        let progress_file = ProgressRead { inner: file, pb: pb.clone(), tx: progress.clone(), total: file_size, last_reported: 0 };
+        let mut encrypting_reader = crate::crypto_stream::EncryptingReader::new(progress_file, file_key);
+
+        let mut shards = Vec::new();
+        let mut server_idx = 0;
+        let mut total_uploaded = 0;
+
+        // Shared reqwest::Client for connection reuse (HTTP/2 multiplexing)
+        let http = reqwest::Client::builder()
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .context("building HTTP client")?;
+
+        let mut buf = Vec::with_capacity(SHARD_SIZE);
+        loop {
+            buf.clear();
+            let n = read_buf_exact(&mut encrypting_reader, &mut buf, SHARD_SIZE).await?;
+
+            if n == 0 && buf.is_empty() {
+                break;
+            }
+
+            let ephemeral_keys = Keys::generate();
+            let priv_key_hex = ephemeral_keys.secret_key().to_secret_hex();
+
+            // Try servers in round-robin order until one accepts the shard
+            let url = {
+                let mut last_err = String::new();
+                let mut uploaded = false;
+                let mut url = String::new();
+                for attempt in 0..SERVERS.len() {
+                    let idx = (server_idx + attempt) % SERVERS.len();
+                    match upload_shard_to_server(&http, SERVERS[idx], &buf, &ephemeral_keys, &fname).await {
+                        Ok(u) => { url = u; uploaded = true; break; }
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                server_idx += 1;
+                if !uploaded {
+                    anyhow::bail!("All Blossom servers rejected shard: {last_err}");
+                }
+                url
+            };
+
+            total_uploaded += n as u64;
+            pb.inc(n as u64);
+            if let Some(tx) = &progress { let _ = tx.send((total_uploaded, file_size)); }
+
+            shards.push(Shard {
+                url,
+                size: n as u64,
+                priv_key: priv_key_hex,
+            });
+
+            if n < SHARD_SIZE {
+                break;
+            }
+        }
+
+        pb.finish_and_clear();
+        if let Some(tx) = &progress { let _ = tx.send((file_size, file_size)); }
+
+        Ok((shards, file_size))
+    }
+
+    pub async fn download(
+        shards: &[Shard],
+        output_path: &Path,
+        file_key: &[u8; 32],
+        original_size: u64,
+        progress: Option<ProgressTx>,
+    ) -> Result<u64> {
+        let fname = output_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let pb = if progress.is_some() {
+            let pb = ProgressBar::new(original_size);
+            pb.set_style(progress_style());
+            pb.set_message(format!("Downloading & Decrypting {fname}"));
+            pb
+        } else { ProgressBar::hidden() };
+
+        if let Some(tx) = &progress { let _ = tx.send((0, original_size)); }
+
+        let output_file = tokio::fs::File::create(output_path).await?;
+        let mut writer = ProgressWrite {
+            inner: tokio::io::BufWriter::new(output_file),
+            pb: pb.clone(),
+            tx: progress.clone(),
+            total: original_size,
+            last_reported: 0,
+        };
+
+        let mut chain = HttpShardChain::new(shards.to_vec());
+        crate::crypto_stream::decrypt_stream(&mut chain, &mut writer, file_key).await.context("decrypting blob")?;
+
+        writer.flush().await?;
+        pb.finish_and_clear();
+        if let Some(tx) = &progress { let _ = tx.send((original_size, original_size)); }
+
+        let meta = tokio::fs::metadata(output_path).await?;
+        let actual_size = meta.len();
+        if original_size > 0 && actual_size != original_size {
+            anyhow::bail!(
+                "downloaded file size mismatch: expected {original_size}, got {actual_size} — the file may be truncated"
+            );
+        }
+        Ok(actual_size)
+    }
+
+    /// Encrypt arbitrary data and upload to Blossom as a single blob.
+    /// Returns (url, priv_key_hex).
+    pub async fn upload_encrypted_blob(data: &[u8], file_key: &[u8; 32], fname: &str) -> Result<(String, String)> {
+        let mut ciphertext = Vec::new();
+        {
+            let reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+            let mut writer = tokio::io::BufWriter::new(&mut ciphertext);
+            crate::crypto_stream::encrypt_stream(reader, &mut writer, file_key).await
+                .context("encrypting blob")?;
+            writer.flush().await?;
+        }
+
+        let http = reqwest::Client::builder()
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .context("building HTTP client")?;
+
+        let ephemeral_keys = Keys::generate();
+        let priv_key_hex = ephemeral_keys.secret_key().to_secret_hex();
+
+        let mut last_err = String::new();
+        for server_url in SERVERS {
+            match upload_shard_to_server(&http, server_url, &ciphertext, &ephemeral_keys, fname).await {
+                Ok(url) => return Ok((url, priv_key_hex)),
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        anyhow::bail!("All Blossom servers rejected encrypted blob: {last_err}")
+    }
+
+    /// Download an encrypted blob from a Blossom URL and decrypt it.
+    pub async fn download_encrypted_blob(url: &str, priv_key: &str, file_key: &[u8; 32]) -> Result<Vec<u8>> {
+        let client = reqwest::Client::builder()
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .context("building HTTP client")?;
+
+        let auth_header = match Keys::parse(priv_key) {
+            Ok(keys) => {
+                let expiry = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() + 3600;
+                match EventBuilder::new(Kind::Custom(24242), "Get file")
+                    .tag(Tag::parse(["t", "get"]).unwrap())
+                    .tag(Tag::parse(["expiration", &expiry.to_string()]).unwrap())
+                    .sign_with_keys(&keys)
+                {
+                    Ok(event) => format!(
+                        "Nostr {}",
+                        base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&event).unwrap())
+                    ),
+                    Err(_) => String::new(),
+                }
+            }
+            Err(_) => String::new(),
+        };
+
+        let mut req = client.get(url);
+        if !auth_header.is_empty() {
+            req = req.header("Authorization", &auth_header);
+        }
+        let mut res = req.send().await?;
+
+        if res.status() == 401 || res.status() == 403 {
+            res = client.get(url).send().await?;
+        }
+
+        if !res.status().is_success() {
+            anyhow::bail!("failed to download encrypted blob: HTTP {}", res.status());
+        }
+
+        let mut ciphertext = Vec::new();
+        loop {
+            match res.chunk().await {
+                Ok(Some(chunk)) => {
+                    if !chunk.is_empty() {
+                        ciphertext.extend_from_slice(&chunk);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    anyhow::bail!("blob download error: {e} — url: {url}");
+                }
+            }
+        }
+
+        let mut plaintext = Vec::with_capacity(ciphertext.len());
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(ciphertext));
+        let mut writer = tokio::io::BufWriter::new(&mut plaintext);
+        crate::crypto_stream::decrypt_stream(reader, &mut writer, file_key).await
+            .context("decrypting blob")?;
+        writer.flush().await?;
+
+        Ok(plaintext)
+    }
+}
+
+async fn read_buf_exact<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>, limit: usize) -> std::io::Result<usize> {
+    buf.resize(limit, 0);
+    let mut total_read = 0;
+    while total_read < limit {
+        let n = match reader.read(&mut buf[total_read..]).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        total_read += n;
+    }
+    buf.truncate(total_read);
+    Ok(total_read)
+}
+
+/// Blossom-style upload: PUT raw body with Kind 24242 auth
+async fn upload_shard_to_server(
+    client: &reqwest::Client,
+    server_url: &str,
+    data: &[u8],
+    keys: &Keys,
+    _filename: &str
+) -> Result<String> {
+
+    // Compute SHA256 for x tag (required by some servers for auth validation)
+    let data_hash = nostr_sdk::bitcoin::hashes::sha256::Hash::hash(data);
+    let hash_hex = data_hash.to_string();
+
+    // Blossom auth: Kind 24242 with t=upload, x=SHA256, expiration tags
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() + 3600;
+    let auth_event: Event = EventBuilder::new(Kind::Custom(24242), "Upload file")
+        .tag(Tag::parse(["t", "upload"])?)
+        .tag(Tag::parse(["x", &hash_hex])?)
+        .tag(Tag::parse(["expiration", &expiry.to_string()])?)
+        .sign_with_keys(keys)?;
+
+    let auth_header = format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&auth_event)?)
+    );
+
+    let res = client
+        .put(server_url)
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/octet-stream")
+        .header("X-SHA-256", &hash_hex)
+        .body(data.to_vec())
+        .send()
+        .await?;
+
+    let status = res.status();
+    let body_text = res.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("Server {} returned error: {} — body: {}", server_url, status, body_text);
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&body_text)?;
+
+    // Blossom response: {"url": "...", "sha256": "..."}
+    if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
+        return Ok(url.to_string());
+    }
+
+    // NIP-96 fallback: nip94_event.tags[url]
+    if body.get("status").and_then(|v| v.as_str()) == Some("success") {
+        if let Some(tags) = body.get("nip94_event").and_then(|v| v.get("tags")).and_then(|v| v.as_array()) {
+            for tag in tags {
+                if let Some(arr) = tag.as_array() {
+                    if arr.len() >= 2 && arr[0].as_str() == Some("url") {
+                        if let Some(url) = arr[1].as_str() {
+                            return Ok(url.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: data field (void.cat style)
+    if let Some(url) = body.get("data").and_then(|v| v.as_str()) {
+        return Ok(url.to_string());
+    }
+
+    anyhow::bail!("Could not parse URL from server response: {:?}", body)
+}
+
+struct HttpShardChain {
+    rx: mpsc::Receiver<std::io::Result<Bytes>>,
+    buffer: Bytes,
+    pos: usize,
+}
+
+impl HttpShardChain {
+    fn new(shards: Vec<Shard>) -> Self {
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+        // Shared client for connection reuse across all shard downloads
+        let client = reqwest::Client::builder()
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .unwrap();
+        tokio::spawn(async move {
+            for shard in shards {
+                // Blossom GET download — auth is optional, use Kind 24242 if needed
+                let auth_header = match Keys::parse(&shard.priv_key) {
+                    Ok(keys) => {
+                        let expiry = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() + 3600;
+                        match EventBuilder::new(Kind::Custom(24242), "Get file")
+                            .tag(Tag::parse(["t", "get"]).unwrap())
+                            .tag(Tag::parse(["expiration", &expiry.to_string()]).unwrap())
+                            .sign_with_keys(&keys)
+                        {
+                            Ok(event) => format!(
+                                "Nostr {}",
+                                base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&event).unwrap())
+                            ),
+                            Err(_) => String::new(),
+                        }
+                    }
+                    Err(_) => String::new(),
+                };
+
+                let mut req = client.get(&shard.url);
+                if !auth_header.is_empty() {
+                    req = req.header("Authorization", &auth_header);
+                }
+                let mut res = match req.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))).await;
+                        return;
+                    }
+                };
+
+                // Fallback to unauthenticated GET if server rejects auth
+                if res.status() == 401 || res.status() == 403 {
+                    res = match client.get(&shard.url).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))).await;
+                            return;
+                        }
+                    };
+                }
+
+                if !res.status().is_success() {
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("HTTP download failed: {}", res.status())
+                    ))).await;
+                    return;
+                }
+
+                let mut received_bytes = 0u64;
+                loop {
+                    match res.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if !chunk.is_empty() {
+                                received_bytes += chunk.len() as u64;
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if received_bytes < shard.size {
+                                let _ = tx.send(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    format!("shard truncated: received {} of {} bytes — url: {}", received_bytes, shard.size, shard.url),
+                                ))).await;
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("shard download error: {e} — url: {}", shard.url),
+                            ))).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Self { rx, buffer: Bytes::new(), pos: 0 }
+    }
+}
+
+impl AsyncRead for HttpShardChain {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.pos < self.buffer.len() {
+            let avail = (self.buffer.len() - self.pos).min(buf.remaining());
+            buf.put_slice(&self.buffer[self.pos..self.pos + avail]);
+            self.pos += avail;
+            return Poll::Ready(Ok(()));
+        }
+
+        match Pin::new(&mut self.rx).poll_recv(cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                self.buffer = data;
+                self.pos = 0;
+                let avail = self.buffer.len().min(buf.remaining());
+                buf.put_slice(&self.buffer[..avail]);
+                self.pos = avail;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 struct ProgressRead<R> {
@@ -36,11 +494,7 @@ struct ProgressRead<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &result {
@@ -50,9 +504,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
                 let pos = self.pb.position();
                 if pos - self.last_reported >= 65536 {
                     self.last_reported = pos;
-                    if let Some(tx) = &self.tx {
-                        let _ = tx.send((pos, self.total));
-                    }
+                    if let Some(tx) = &self.tx { let _ = tx.send((pos, self.total)); }
                 }
             }
         }
@@ -69,20 +521,14 @@ struct ProgressWrite<W> {
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWrite<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
             self.pb.inc(*n as u64);
             let pos = self.pb.position();
             if pos - self.last_reported >= 65536 {
                 self.last_reported = pos;
-                if let Some(tx) = &self.tx {
-                    let _ = tx.send((pos, self.total));
-                }
+                if let Some(tx) = &self.tx { let _ = tx.send((pos, self.total)); }
             }
         }
         result
@@ -92,397 +538,5 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWrite<W> {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// Static blob storage operations using an iroh node.
-pub struct BlobStore;
-
-impl BlobStore {
-    /// Upload a file: encrypt via EncryptingReader, add encrypted blob.
-    /// Returns (hash_string, original_file_size).
-    pub async fn upload(
-        node: &IrohNode,
-        local_path: &Path,
-        file_key: &[u8; 32],
-        progress: Option<ProgressTx>,
-    ) -> Result<(String, u64)> {
-        let file = tokio::fs::File::open(local_path)
-            .await
-            .context("opening file")?;
-        let metadata = file.metadata().await?;
-        let file_size = metadata.len();
-
-        let fname = local_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let pb = if progress.is_some() {
-            let pb = ProgressBar::new(file_size);
-            pb.set_style(progress_style());
-            pb.set_message(format!("Uploading {fname}"));
-            pb
-        } else {
-            ProgressBar::hidden()
-        };
-
-        if let Some(tx) = &progress {
-            let _ = tx.send((0, file_size));
-        }
-        let progress_file = ProgressRead {
-            inner: file,
-            pb: pb.clone(),
-            tx: progress.clone(),
-            total: file_size,
-            last_reported: 0,
-        };
-        let encrypting_reader = crate::crypto_stream::EncryptingReader::new(progress_file, file_key);
-
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .context("getting blobs protocol")?;
-        let store = blobs_proto.store();
-        let (temp_tag, _stored_size) = store
-            .import_reader(
-                encrypting_reader,
-                BlobFormat::Raw,
-                iroh_blobs::util::progress::IgnoreProgressSender::default(),
-            )
-            .await
-            .context("importing encrypted blob")?;
-        pb.finish_and_clear();
-        if let Some(tx) = &progress {
-            let _ = tx.send((file_size, file_size));
-        }
-        let hash = *temp_tag.hash();
-        let hash_str = format!("blake3:{}", hash);
-        Ok((hash_str, file_size))
-    }
-
-    /// Download a blob, decrypt, write to output_path.
-    /// Streams data chunk-by-chunk from the blob store through decryption to disk,
-    /// never buffering the entire file in memory.
-    pub async fn download(
-        node: &IrohNode,
-        blob_hash_str: &str,
-        output_path: &Path,
-        file_key: &[u8; 32],
-        original_size: u64,
-        progress: Option<ProgressTx>,
-    ) -> Result<u64> {
-        let hash = blob_hash_str
-            .strip_prefix("blake3:")
-            .unwrap_or(blob_hash_str)
-            .parse::<Hash>()
-            .context("invalid blob hash")?;
-
-        // Stream blob directly from the iroh node, decrypting on the fly
-        let blob_reader = node.client().blobs().read(hash).await?;
-
-        let fname = output_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let pb = if progress.is_some() {
-            let pb = ProgressBar::new(original_size);
-            pb.set_style(progress_style());
-            pb.set_message(format!("Downloading {fname}"));
-            pb
-        } else {
-            ProgressBar::hidden()
-        };
-
-        if let Some(tx) = &progress {
-            let _ = tx.send((0, original_size));
-        }
-        let output_file = tokio::fs::File::create(output_path).await?;
-        let mut writer = ProgressWrite {
-            inner: tokio::io::BufWriter::new(output_file),
-            pb: pb.clone(),
-            tx: progress.clone(),
-            total: original_size,
-            last_reported: 0,
-        };
-        crate::crypto_stream::decrypt_stream(blob_reader, &mut writer, file_key)
-            .await
-            .context("decrypting blob")?;
-        writer.flush().await?;
-        pb.finish_and_clear();
-        if let Some(tx) = &progress {
-            let _ = tx.send((original_size, original_size));
-        }
-
-        let meta = tokio::fs::metadata(output_path).await?;
-        let actual_size = meta.len();
-        if original_size > 0 && actual_size != original_size {
-            anyhow::bail!(
-                "downloaded file size mismatch: expected {original_size}, got {actual_size} — the file may be truncated"
-            );
-        }
-        Ok(actual_size)
-    }
-
-    /// Check if a blob exists in the local store.
-    pub async fn has_blob(node: &IrohNode, blob_hash_str: &str) -> Result<bool> {
-        let hash = blob_hash_str
-            .strip_prefix("blake3:")
-            .unwrap_or(blob_hash_str)
-            .parse::<Hash>()?;
-
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .context("getting blobs protocol")?;
-        let store = blobs_proto.store();
-        match store.get(&hash).await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Download a blob from a remote peer and store it locally.
-    /// `node_addr_str` is the serialized `NodeAddr` (Display format).
-    pub async fn fetch_from_peer(
-        node: &IrohNode,
-        hash: &iroh_blobs::Hash,
-        node_addr_str: &str,
-    ) -> Result<()> {
-        let node_addr: NodeAddr = serde_json::from_str(node_addr_str)
-            .context("invalid NodeAddr in manifest")?;
-
-        // Register the peer address with the node for connectivity
-        let _ = node.client().net().add_node_addr(node_addr.clone()).await;
-
-        let progress = node
-            .client()
-            .blobs()
-            .download(*hash, node_addr)
-            .await
-            .context("starting download from peer")?;
-
-        let outcome = progress.await.context("waiting for download")?;
-        if outcome.downloaded_size > 0 {
-            Ok(())
-        } else if outcome.local_size > 0 {
-            Ok(()) // already had it locally
-        } else {
-            anyhow::bail!("peer returned no data")
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Read blob data directly from the local store, bypassing quic-rpc.
-    async fn read_blob_local(node: &IrohNode, hash: Hash) -> Result<Vec<u8>> {
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .context("getting blobs protocol")?;
-        let store = blobs_proto.store();
-        let entry = store
-            .get(&hash)
-            .await
-            .context("looking up blob in store")?
-            .context("blob not found in local store")?;
-        let mut reader = entry.data_reader().await?;
-        let bytes = reader.read_to_end().await?;
-        Ok(bytes.to_vec())
-    }
-
-    async fn make_node() -> IrohNode {
-        let secret = iroh::base::key::SecretKey::generate();
-        iroh::node::Node::memory()
-            .secret_key(secret)
-            .spawn()
-            .await
-            .unwrap()
-    }
-
-    async fn upload_bytes(node: &IrohNode, data: &[u8]) -> Hash {
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(data.to_vec()));
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .unwrap();
-        let store = blobs_proto.store();
-        let (temp_tag, _size) = store
-            .import_reader(
-                reader,
-                BlobFormat::Raw,
-                iroh_blobs::util::progress::IgnoreProgressSender::default(),
-            )
-            .await
-            .unwrap();
-        *temp_tag.hash()
-    }
-
-    #[tokio::test]
-    async fn test_iroh_small_roundtrip() {
-        let node = make_node().await;
-
-        let plaintext = b"ZD1\n\xab\x00\x00\x00\x05hello";
-        let hash = upload_bytes(&node, plaintext).await;
-        let bytes = read_blob_local(&node, hash).await.unwrap();
-        assert_eq!(bytes.len(), plaintext.len());
-        assert_eq!(&bytes[..], plaintext);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_iroh_large_roundtrip() {
-        let node = make_node().await;
-
-        let data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
-        let hash = upload_bytes(&node, &data).await;
-        let bytes = read_blob_local(&node, hash).await.unwrap();
-        assert_eq!(bytes.len(), data.len());
-        assert_eq!(&bytes[..], &data);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_encrypt_store_decrypt() {
-        let node = make_node().await;
-
-        let plaintext: Vec<u8> = (0..100).map(|i| i as u8).collect();
-        let key = [0xab; 32];
-
-        // Encrypt using encrypt_stream (the working path)
-        let mut ct = Vec::new();
-        let r = tokio::io::BufReader::new(std::io::Cursor::new(plaintext.clone()));
-        let mut w = tokio::io::BufWriter::new(&mut ct);
-        crate::crypto_stream::encrypt_stream(r, &mut w, &key).await.unwrap();
-        drop(w);
-        eprintln!("encrypt_stream produced {} bytes", ct.len());
-
-        // Store the encrypted data
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(ct.clone()));
-        let blobs_proto = node
-            .get_protocol::<iroh_blobs::net_protocol::Blobs<MemStore>>(
-                iroh_blobs::protocol::ALPN,
-            )
-            .unwrap();
-        let store = blobs_proto.store();
-        let (temp_tag, _size) = store
-            .import_reader(
-                reader,
-                BlobFormat::Raw,
-                iroh_blobs::util::progress::IgnoreProgressSender::default(),
-            )
-            .await
-            .unwrap();
-        let hash = *temp_tag.hash();
-
-        // Read back via data_reader
-        let entry = store.get(&hash).await.unwrap().unwrap();
-        let mut reader = entry.data_reader().await.unwrap();
-        let stored = reader.read_to_end().await.unwrap().to_vec();
-        eprintln!("stored {} bytes (same as input: {})", stored.len(), stored.len() == ct.len());
-        assert_eq!(stored.len(), ct.len(), "size changed through store");
-        assert_eq!(stored, ct, "data changed through store");
-
-        // Manually decrypt byte-by-byte using read_exact
-        {
-            use tokio::io::AsyncReadExt;
-            let mut cursor = std::io::Cursor::new(ct.clone());
-            let mut magic = [0u8; 4];
-            cursor.read_exact(&mut magic).await.unwrap();
-            eprintln!("magic: {:02x?}", magic);
-            let mut nonce_prefix = [0u8; 8];
-            cursor.read_exact(&mut nonce_prefix).await.unwrap();
-            eprintln!("nonce_prefix: {:02x?}", nonce_prefix);
-            let mut len_buf = [0u8; 4];
-            cursor.read_exact(&mut len_buf).await.unwrap();
-            let chunk_len = u32::from_be_bytes(len_buf) as usize;
-            eprintln!("chunk_len: {} (remaining in cursor: {})", chunk_len, cursor.get_ref().len() - cursor.position() as usize);
-            let mut ciphertext = vec![0u8; chunk_len];
-            cursor.read_exact(&mut ciphertext).await.unwrap();
-            eprintln!("ciphertext read successfully, remaining: {}", cursor.get_ref().len() - cursor.position() as usize);
-        }
-
-        // Test: decrypt the encrypt_stream output directly with DecryptingReader
-        // (no iroh store in between)
-        let cursor = std::io::Cursor::new(ct.clone());
-        let mut decrypting = crate::crypto_stream::DecryptingReader::new(cursor, &key);
-        let mut decrypted = Vec::new();
-        tokio::io::copy(&mut decrypting, &mut decrypted).await.unwrap();
-        assert_eq!(decrypted.len(), plaintext.len());
-        assert_eq!(&decrypted[..], &plaintext);
-        eprintln!("DecryptingReader works directly (no iroh)");
-
-        node.shutdown().await.unwrap();
-    }
-
-    async fn upload_download_roundtrip(
-        node: &IrohNode,
-        data: &[u8],
-        key: &[u8; 32],
-    ) {
-        let dir = std::env::temp_dir().join(format!("zd-rd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.bin");
-        std::fs::write(&src, data).unwrap();
-
-        let (hash, _size) = BlobStore::upload(node, &src, key, None).await.unwrap();
-
-
-        let out = dir.join("out.bin");
-        let _size = BlobStore::download(node, &hash, &out, key, data.len() as u64, None).await.unwrap();
-
-        let downloaded = std::fs::read(&out).unwrap();
-        assert_eq!(downloaded.len(), data.len());
-        assert_eq!(&downloaded[..], data);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_download_size_mismatch_detection() {
-        let node = make_node().await;
-        let key = [0xef; 32];
-
-        let data: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
-        let dir = std::env::temp_dir().join(format!("zd-mismatch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.bin");
-        std::fs::write(&src, &data).unwrap();
-
-        let (hash, _size) = BlobStore::upload(&node, &src, &key, None).await.unwrap();
-
-        let out = dir.join("out.bin");
-        let wrong_size = (data.len() as u64) / 2;
-        let result = BlobStore::download(&node, &hash, &out, &key, wrong_size, None).await;
-
-        assert!(result.is_err(), "Download with wrong original_size should fail");
-        assert!(result.unwrap_err().to_string().contains("size mismatch"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_upload_file_then_download() {
-        let node = make_node().await;
-
-        let key = [0xcd; 32];
-
-        let data1: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
-        upload_download_roundtrip(&node, &data1, &key).await;
-        eprintln!("10KB roundtrip OK");
-
-        let data2: Vec<u8> = (0..2_000_000).map(|i| (i % 251) as u8).collect();
-        upload_download_roundtrip(&node, &data2, &key).await;
-        eprintln!("2MB roundtrip OK");
-
-        node.shutdown().await.unwrap();
     }
 }

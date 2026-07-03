@@ -11,7 +11,7 @@ use futures_core::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
-use iroh_io::AsyncSliceReader;
+
 use zeroize::Zeroize;
 
 /// Encrypted container format:
@@ -175,112 +175,6 @@ where
 
         writer.write_all(&plaintext).await?;
         chunk_idx += 1;
-    }
-    writer.flush().await?;
-    Ok(())
-}
-
-/// Decrypt an AsyncSliceReader (offset-based) chunk-by-chunk to a writer.
-/// Supports both ZD3 (current) and ZD2 (legacy) container formats.
-#[allow(dead_code)]
-pub async fn decrypt_slice_to_writer<R: AsyncSliceReader + Unpin>(
-    reader: &mut R,
-    writer: &mut (impl AsyncWrite + Unpin),
-    key: &[u8; 32],
-) -> Result<()> {
-    let mut offset = 0u64;
-
-    let magic = reader.read_exact_at(offset, MAGIC.len()).await?;
-    offset += MAGIC.len() as u64;
-
-    if &magic[..] == MAGIC {
-        decrypt_slice_v3(reader, writer, key, offset).await
-    } else if &magic[..] == MAGIC_V2 {
-        decrypt_slice_v2(reader, writer, key, offset).await
-    } else {
-        bail!("invalid magic bytes");
-    }
-}
-
-async fn decrypt_slice_v3<R: AsyncSliceReader + Unpin>(
-    reader: &mut R,
-    writer: &mut (impl AsyncWrite + Unpin),
-    key: &[u8; 32],
-    mut offset: u64,
-) -> Result<()> {
-    let nonce_prefix = reader.read_exact_at(offset, NONCE_PREFIX_LEN).await?;
-    offset += NONCE_PREFIX_LEN as u64;
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let mut chunk_nonce = [0u8; 12];
-    let mut idx: u32 = 0;
-
-    loop {
-        let len_bytes = reader.read_exact_at(offset, 4).await?;
-        offset += 4;
-        let chunk_len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-        if chunk_len == 0 {
-            break;
-        }
-        if chunk_len > MAX_CHUNK_CIPHER {
-            bail!("chunk too large: {chunk_len}");
-        }
-
-        let ciphertext = reader.read_exact_at(offset, chunk_len).await?;
-        offset += chunk_len as u64;
-
-        chunk_nonce[..NONCE_PREFIX_LEN].copy_from_slice(&nonce_prefix);
-        chunk_nonce[NONCE_PREFIX_LEN..].copy_from_slice(&idx.to_be_bytes());
-        let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
-
-        let plaintext = cipher
-            .decrypt(nonce, Payload { msg: &ciphertext, aad: MAGIC })
-            .map_err(|e| anyhow::anyhow!("decrypt error at chunk {idx}: {e}"))?;
-
-        writer.write_all(&plaintext).await?;
-        idx += 1;
-    }
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn decrypt_slice_v2<R: AsyncSliceReader + Unpin>(
-    reader: &mut R,
-    writer: &mut (impl AsyncWrite + Unpin),
-    key: &[u8; 32],
-    mut offset: u64,
-) -> Result<()> {
-    let nonce_prefix = reader.read_exact_at(offset, NONCE_PREFIX_LEN).await?;
-    offset += NONCE_PREFIX_LEN as u64;
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let mut chunk_nonce = [0u8; 12];
-    let mut idx: u32 = 0;
-
-    loop {
-        let len_bytes = match reader.read_exact_at(offset, 4).await {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        offset += 4;
-        let chunk_len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-        if chunk_len > MAX_CHUNK_CIPHER {
-            bail!("chunk too large: {chunk_len}");
-        }
-
-        let ciphertext = reader.read_exact_at(offset, chunk_len).await?;
-        offset += chunk_len as u64;
-
-        chunk_nonce[..NONCE_PREFIX_LEN].copy_from_slice(&nonce_prefix);
-        chunk_nonce[NONCE_PREFIX_LEN..].copy_from_slice(&idx.to_be_bytes());
-        let nonce = Nonce::<Aes256Gcm>::from_slice(&chunk_nonce);
-
-        let plaintext = cipher
-            .decrypt(nonce, Payload { msg: &ciphertext, aad: b"" })
-            .map_err(|e| anyhow::anyhow!("decrypt error at chunk {idx}: {e}"))?;
-
-        writer.write_all(&plaintext).await?;
-        idx += 1;
     }
     writer.flush().await?;
     Ok(())

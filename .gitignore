@@ -1,1 +1,4 @@
 /target
+
+# Android signing keystore (contains private key)
+release.keystore

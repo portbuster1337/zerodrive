@@ -267,7 +267,7 @@ async fn create_drive_handler(Json(body): Json<serde_json::Value>) -> impl IntoR
 }
 
 async fn delete_drive_handler(Path(name): Path<String>) -> impl IntoResponse {
-    match ipc("delete", json!({ "drive": name, "name": null, "purge": false })).await {
+    match ipc("delete", json!({ "drive": name, "name": null })).await {
         Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(resp) => resp,
     }
@@ -289,7 +289,7 @@ async fn list_files_handler(Path(name): Path<String>) -> impl IntoResponse {
 }
 
 async fn delete_file_handler(Path((drive, file)): Path<(String, String)>) -> impl IntoResponse {
-    match ipc("delete", json!({ "drive": drive, "name": file, "purge": false })).await {
+    match ipc("delete", json!({ "drive": drive, "name": file })).await {
         Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(resp) => resp,
     }
@@ -364,11 +364,10 @@ async fn upload_handler(
 
         match result {
             Ok(r) => {
-                let hash = r.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
                 let size = r.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
                 return (
                     StatusCode::CREATED,
-                    Json(json!({ "ok": true, "hash": hash, "size": size, "name": file_name })),
+                    Json(json!({ "ok": true, "size": size, "name": file_name })),
                 )
                     .into_response();
             }
@@ -452,7 +451,7 @@ async fn download_handler(
 
 // ── Embedded Frontend ──
 
-const FRONTEND_HTML: &str = r###"<!DOCTYPE html>
+pub const FRONTEND_HTML: &str = r###"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">

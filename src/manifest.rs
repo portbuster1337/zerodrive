@@ -26,13 +26,26 @@ pub struct Drive {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shard {
+    pub url: String,
+    pub size: u64,
+    pub priv_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardManifestRef {
+    pub url: String,
+    pub priv_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
-    pub hash: String,
     pub size: u64,
-    #[serde(default)]
-    pub providers: Vec<String>,
+    pub shards: Vec<Shard>,
     pub added_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_manifest: Option<ShardManifestRef>,
 }
 
 impl Manifest {
@@ -84,21 +97,18 @@ impl Manifest {
         result
     }
 
-    /// Get a drive by name, returns error if not found.
     pub fn get_drive(&self, name: &str) -> Result<&Drive> {
         self.drives
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("drive '{name}' not found"))
     }
 
-    /// Get a mutable drive by name.
     pub fn get_drive_mut(&mut self, name: &str) -> Result<&mut Drive> {
         self.drives
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("drive '{name}' not found"))
     }
 
-    /// Create a new drive.
     pub fn create_drive(&mut self, name: &str) -> Result<&mut Drive> {
         if self.drives.contains_key(name) {
             anyhow::bail!("drive '{name}' already exists");
@@ -112,14 +122,23 @@ impl Manifest {
         Ok(self.drives.get_mut(name).unwrap())
     }
 
-    /// Add a file entry to a drive (node_addr is the full NodeAddr serialization).
     pub fn add_file(
         &mut self,
         drive_name: &str,
         name: &str,
-        hash: &str,
         size: u64,
-        node_addr: &str,
+        shards: Vec<Shard>,
+    ) -> Result<()> {
+        self.add_file_with_manifest(drive_name, name, size, shards, None)
+    }
+
+    pub fn add_file_with_manifest(
+        &mut self,
+        drive_name: &str,
+        name: &str,
+        size: u64,
+        shards: Vec<Shard>,
+        shard_manifest: Option<ShardManifestRef>,
     ) -> Result<()> {
         let drive = self.get_drive_mut(drive_name)?;
         if drive.files.iter().any(|f| f.name == name) {
@@ -127,16 +146,15 @@ impl Manifest {
         }
         drive.files.push(FileEntry {
             name: name.to_string(),
-            hash: hash.to_string(),
             size,
-            providers: vec![node_addr.to_string()],
+            shards,
             added_at: Utc::now().timestamp(),
+            shard_manifest,
         });
         self.updated_at = Utc::now().timestamp();
         Ok(())
     }
 
-    /// Remove a file from a drive.
     pub fn remove_file(&mut self, drive_name: &str, name: &str) -> Result<()> {
         let drive = self.get_drive_mut(drive_name)?;
         let len_before = drive.files.len();
@@ -148,16 +166,6 @@ impl Manifest {
         Ok(())
     }
 
-    /// Count how many file entries across all drives reference a given hash.
-    pub fn hash_refcount(&self, hash: &str) -> usize {
-        self.drives
-            .values()
-            .flat_map(|d| &d.files)
-            .filter(|f| f.hash == hash)
-            .count()
-    }
-
-    /// List drives or files in a drive.
     pub fn list_drives(&self) -> Vec<&str> {
         self.drives.keys().map(|s| s.as_str()).collect()
     }
@@ -182,25 +190,16 @@ mod manifest_tests {
         let mut m = Manifest::new();
         m.create_drive("docs").unwrap();
 
-        m.add_file("docs", "resume.pdf", "blake3:hash1", 1024, "nodeaddr1").unwrap();
+        m.add_file("docs", "resume.pdf", 1024, vec![]).unwrap();
 
-        // Duplicate file name should fail
-        assert!(m.add_file("docs", "resume.pdf", "blake3:hash2", 2048, "nodeaddr1").is_err());
+        assert!(m.add_file("docs", "resume.pdf", 2048, vec![]).is_err());
 
-        // Duplicate drive name should fail
         assert!(m.create_drive("docs").is_err());
 
-        // Verify hash refcount (hash1 is referenced once)
-        assert_eq!(m.hash_refcount("blake3:hash1"), 1);
-
-        // Add same hash to another drive
         m.create_drive("backup").unwrap();
-        m.add_file("backup", "resume_backup.pdf", "blake3:hash1", 1024, "nodeaddr2").unwrap();
-        assert_eq!(m.hash_refcount("blake3:hash1"), 2);
+        m.add_file("backup", "resume_backup.pdf", 1024, vec![]).unwrap();
 
-        // Remove from one drive, refcount should drop
         m.remove_file("docs", "resume.pdf").unwrap();
-        assert_eq!(m.hash_refcount("blake3:hash1"), 1);
     }
 
     #[tokio::test]
@@ -211,7 +210,6 @@ mod manifest_tests {
 
         let ct = m.encrypt(&key1).await.unwrap();
 
-        // Decrypting with the wrong key should fail
         let result = Manifest::decrypt(&ct, &key2).await;
         assert!(result.is_err());
     }

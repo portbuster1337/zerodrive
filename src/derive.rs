@@ -5,10 +5,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedKeys {
     pub nostr_secret_key: [u8; 32],
-    pub iroh_secret_key_bytes: [u8; 32],
     pub manifest_key: [u8; 32],
     pub file_key: [u8; 32],
 }
@@ -31,18 +30,14 @@ fn derive_from_seed(seed: &[u8; 64]) -> DerivedKeys {
         .expect("BIP-32 derivation should never fail for valid path");
     let nostr_secret_key = xprv.private_key().to_bytes();
 
-    // 2. Iroh key: HKDF-SHA256(seed, "zerodrive/iroh/v1")
-    let iroh_secret_key_bytes = hkdf_extract(seed, b"zerodrive/iroh/v1");
-
-    // 3. Manifest encryption key: HKDF-SHA256(seed, "zerodrive/manifest/v1")
+    // 2. Manifest encryption key: HKDF-SHA256(seed, "zerodrive/manifest/v1")
     let manifest_key = hkdf_extract(seed, b"zerodrive/manifest/v1");
 
-    // 4. File encryption key: HKDF-SHA256(seed, "zerodrive/files/v1")
+    // 3. File encryption key: HKDF-SHA256(seed, "zerodrive/files/v1")
     let file_key = hkdf_extract(seed, b"zerodrive/files/v1");
 
     DerivedKeys {
         nostr_secret_key: nostr_secret_key.into(),
-        iroh_secret_key_bytes,
         manifest_key,
         file_key,
     }
@@ -69,7 +64,6 @@ mod tests {
         let b = derive(&mnemonic).unwrap();
 
         assert_eq!(a.nostr_secret_key, b.nostr_secret_key, "Nostr key must be deterministic");
-        assert_eq!(a.iroh_secret_key_bytes, b.iroh_secret_key_bytes, "Iroh key must be deterministic");
         assert_eq!(a.manifest_key, b.manifest_key, "Manifest key must be deterministic");
         assert_eq!(a.file_key, b.file_key, "File key must be deterministic");
     }

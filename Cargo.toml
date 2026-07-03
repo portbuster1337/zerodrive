@@ -2,10 +2,17 @@
 name = "zerodrive"
 version = "0.1.0"
 edition = "2021"
-description = "Decentralized, secure file drive over Nostr + Iroh"
+description = "Decentralized, secure file drive over Nostr"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+jni = "0.19"
 
 [dependencies]
 # CLI
@@ -14,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+futures-core = "0.3"
 
 # Crypto
 bip39 = { version = "2", features = ["rand"] }
@@ -38,20 +46,18 @@ base64 = "0.22"
 
 # Networking
 nostr-sdk = { version = "0.38", features = ["nip06"] }
-iroh = "0.28"
-iroh-blobs = "0.28"
-iroh-io = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "multipart", "rustls-tls", "http2"] }
 
 # Error handling
 anyhow = "1"
 bytes = "1"
-futures-core = "0.3"
 thiserror = "2"
 
 # Logging / output
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 owo-colors = "4"
+log = "0.4"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -76,3 +82,32 @@ lto = true
 strip = true
 codegen-units = 1
 opt-level = "s"
+
+[package.metadata.android]
+use_aapt2 = true
+package = "com.zerodrive.app"
+java_sources = "src/android/java"
+resources = "res"
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 35
+
+[package.metadata.android.signing.release]
+path = "release.keystore"
+keystore_password = "android"
+
+[package.metadata.android.application]
+label = "ZeroDrive"
+theme = "@style/AppTheme"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.application.activity]]
+name = ".MainActivity"
+config_changes = "orientation|keyboardHidden|screenSize"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
