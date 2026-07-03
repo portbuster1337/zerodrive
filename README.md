@@ -2,6 +2,8 @@
 
 A CLI tool + Android app for decentralized, encrypted file storage over Nostr. Your files are encrypted client-side and stored on Blossom CDN servers; metadata is published as encrypted Nostr kind-30078 events. Only your mnemonic phrase can unlock everything.
 
+You can generate a seedphrase from https://iancoleman.io/bip39/
+
 ## What? Where? Who?
 
 | What | Where | Who can read it? |
